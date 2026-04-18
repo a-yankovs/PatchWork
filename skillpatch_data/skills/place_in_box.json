@@ -1,0 +1,21 @@
+{
+  "skill_name": "place_in_box",
+  "description": "Place the object currently held in the gripper into the target box.",
+  "steps": [
+    {
+      "step_id": 0,
+      "name": "place_in_box",
+      "dataset_repo_id": "./data/place_in_box_v4",
+      "verification_query": "Is the object now placed inside the box?",
+      "expected_result": true,
+      "description": "Place into box \u2014 best recording is v4."
+    }
+  ],
+  "default_params": {
+    "z_offset_mm": 0.0,
+    "speed_scale": 1.0,
+    "approach_angle_deg": 0.0,
+    "gripper_close_force": 0.6,
+    "retry_count": 2
+  }
+}

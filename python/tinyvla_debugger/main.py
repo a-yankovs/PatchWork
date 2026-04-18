@@ -37,6 +37,7 @@ from typing import Optional
 
 from .orchestrator import Orchestrator, MockRobotAPI, MockVLMAPI, SkillAbortError
 from .audio_feedback import AudioFeedback
+from .robot_api import RobotAPI
 from .stt import SpeechListener
 from .webcam_stream import WebcamStream
 
@@ -63,12 +64,17 @@ def _build_orchestrator(
     webcam_index: int,
     frame_source,
     compiler_backend: str,
+    robot_port: str,
+    teleop_port: str,
+    robot_id: str,
+    teleop_id: str,
+    storage_dir: str,
 ) -> Orchestrator:
     """
     Build the orchestrator with the right backends.
 
-    Mock mode:   MockRobotAPI + MockVLMAPI + mock compiler
-    Real mode:   Real robot_api + real vlm_api + auto-detect compiler backend
+    Mock mode:   MockRobotAPI + MockVLMAPI + mock compiler (no hardware needed)
+    Real mode:   RobotAPI(SO-100) + vlm_api(Moondream2) + Phi-3 compiler
     """
     if mock:
         robot = MockRobotAPI(failure_on_step=1)  # step 1 fails on first attempt → exercises patch path
@@ -82,7 +88,17 @@ def _build_orchestrator(
             audio=AudioFeedback(enabled=False),  # no ElevenLabs calls in mock mode
         )
 
+    # [REAL] Instantiate hardware-backed RobotAPI.
+    # Ports/IDs come from CLI args (or env var fallbacks set in main()).
+    robot = RobotAPI(
+        robot_port=robot_port,
+        teleop_port=teleop_port,
+        robot_id=robot_id,
+        teleop_id=teleop_id,
+        storage_dir=storage_dir,
+    )
     return Orchestrator(
+        robot=robot,
         compiler_backend=compiler_backend,
         webcam_index=webcam_index,
         frame_source=frame_source,
@@ -142,6 +158,9 @@ async def _main_async(args: argparse.Namespace) -> None:
         print(f"  • SLM        → Phi-3-mini ({args.compiler})")
         print(f"  • Webcam     → device {args.webcam}")
         print("  • VLM        → Moondream2 via Ollama (localhost:11434)")
+        print(f"  • Robot      → SO-100 follower ({args.robot_port}, id={args.robot_id})")
+        print(f"  • Teleop     → SO-100 leader  ({args.teleop_port}, id={args.teleop_id})")
+        print(f"  • Storage    → {args.storage_dir}")
         print("  • Audio      → ElevenLabs TTS (ELEVENLABS_API_KEY)")
 
     # ------------------------------------------------------------------
@@ -167,6 +186,11 @@ async def _main_async(args: argparse.Namespace) -> None:
             webcam_index=args.webcam,
             frame_source=cam.get_latest_frame,
             compiler_backend=args.compiler,
+            robot_port=args.robot_port,
+            teleop_port=args.teleop_port,
+            robot_id=args.robot_id,
+            teleop_id=args.teleop_id,
+            storage_dir=args.storage_dir,
         )
 
         # ------------------------------------------------------------------
@@ -235,7 +259,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Skip STT; use this text command directly",
     )
 
-    # --- Hardware ---
+    # --- Hardware: webcam + compiler ---
     parser.add_argument(
         "--webcam", type=int, default=1, metavar="N",
         help="OpenCV webcam device index (default: 1 — AMD USB webcam; laptop built-in is 0)",
@@ -244,6 +268,29 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--compiler", default="auto",
         choices=["auto", "llama_cpp", "onnx_rocm", "mock"],
         help="SLM compiler backend (default: auto — tries llama_cpp then onnx_rocm)",
+    )
+
+    # --- Hardware: robot arm (real mode only, ignored in --mock) ---
+    import os
+    parser.add_argument(
+        "--robot-port", default=os.environ.get("ROBOT_PORT", "/dev/ttyUSB0"),
+        help="Serial port for SO-100 follower arm (default: $ROBOT_PORT or /dev/ttyUSB0)",
+    )
+    parser.add_argument(
+        "--teleop-port", default=os.environ.get("TELEOP_PORT", "/dev/ttyUSB1"),
+        help="Serial port for SO-100 leader arm (default: $TELEOP_PORT or /dev/ttyUSB1)",
+    )
+    parser.add_argument(
+        "--robot-id", default=os.environ.get("ROBOT_ID", "follower_arm"),
+        help="Robot arm identifier (default: $ROBOT_ID or follower_arm)",
+    )
+    parser.add_argument(
+        "--teleop-id", default=os.environ.get("TELEOP_ID", "leader_arm"),
+        help="Teleop arm identifier (default: $TELEOP_ID or leader_arm)",
+    )
+    parser.add_argument(
+        "--storage-dir", default=os.environ.get("ROBOT_STORAGE_DIR", "./skillpatch_data"),
+        help="Directory for skill manifests and patch storage (default: ./skillpatch_data)",
     )
 
     # --- STT ---

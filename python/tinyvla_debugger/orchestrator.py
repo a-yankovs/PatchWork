@@ -142,11 +142,20 @@ class Orchestrator:
         self.compiler = SkillCompiler(backend=compiler_backend)
 
         # Layer 2 — robot (real or mock)
+        # Pass a RobotAPI instance explicitly for real hardware, or MockRobotAPI for tests.
+        # Auto-instantiation from env vars is the fallback when no robot is provided.
         if robot is not None:
             self._robot = robot
         else:
-            from . import robot_api as _robot_api
-            self._robot = _robot_api  # type: ignore[assignment]
+            import os
+            from .robot_api import RobotAPI
+            self._robot = RobotAPI(
+                robot_port=os.environ.get("ROBOT_PORT", "/dev/ttyUSB0"),
+                teleop_port=os.environ.get("TELEOP_PORT", "/dev/ttyUSB1"),
+                robot_id=os.environ.get("ROBOT_ID", "follower_arm"),
+                teleop_id=os.environ.get("TELEOP_ID", "leader_arm"),
+                storage_dir=os.environ.get("ROBOT_STORAGE_DIR", "./skillpatch_data"),
+            )
 
         # Layer 3 — VLM (real or mock)
         if vlm is not None:
@@ -546,16 +555,19 @@ class MockRobotAPI:
         from .robot_api import StepEvent
         for i in range(self.num_steps):
             # [MOCK] gripper_state and action name are synthetic.
-            # [REAL] robot_api yields StepEvents from the SO-100 arm
+            # [REAL] RobotAPI yields StepEvents from the SO-100 arm
             #        with live gripper sensor readings and the actual
             #        trajectory action name.
             gripper = "open" if i == self.failure_on_step else "closed"
             yield StepEvent(
+                skill_name=skill_name,
                 step_id=i,
                 action=skill_name,
                 timestamp=time.time(),
+                dataset_repo_id=f"mock/{skill_name}_step_{i}",
                 gripper_state=gripper,
                 params_used=dict(params),
+                result="EXECUTED",
             )
 
     def apply_patch(self, skill_name: str, patch: dict) -> None:

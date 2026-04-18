@@ -1,0 +1,29 @@
+{
+  "skill_name": "box_in_shelf",
+  "description": "Pick up a box and place it upright in an empty shelf slot.",
+  "steps": [
+    {
+      "step_id": 0,
+      "name": "pick_object",
+      "dataset_repo_id": "./data/pick_object_v5",
+      "verification_query": "Is a box held securely in the gripper?",
+      "expected_result": true,
+      "description": "Pick the box."
+    },
+    {
+      "step_id": 1,
+      "name": "move_box_to_shelf",
+      "dataset_repo_id": "./data/place_in_shelf",
+      "verification_query": "Is a box standing upright in the shelf slot?",
+      "expected_result": true,
+      "description": "Place the box upright into the shelf slot."
+    }
+  ],
+  "default_params": {
+    "z_offset_mm": 0.0,
+    "speed_scale": 0.8,
+    "approach_angle_deg": 0.0,
+    "gripper_close_force": 0.7,
+    "retry_count": 2
+  }
+}
