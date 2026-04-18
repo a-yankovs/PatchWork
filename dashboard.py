@@ -3,8 +3,17 @@
 # the ReAct agentic loop phase, NPU vs CPU latency, execution history, and patch memory.
 
 import json
+import socket
+import threading
+import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+import cv2
+import numpy as np
+
 
 import pandas as pd
 import plotly.graph_objects as go
