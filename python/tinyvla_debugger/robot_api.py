@@ -410,14 +410,14 @@ class RobotAPI:
 
     def _replay_single_step(self, dataset_repo_id: str, *, episode: int = 0) -> None:
         # dataset_repo_id may be a local path like "./data/pick_object_v5".
-        # lerobot-replay expects:
-        #   --dataset.repo_id=pick_object_v5   (just the folder name)
-        #   --dataset.root=./data              (parent directory)
-        # Passing the full path as repo_id causes an HFValidationError.
+        # LeRobot v3 loads metadata from {root}/meta/info.json, meaning root
+        # must be the dataset directory itself, not its parent.
+        # So:   --dataset.repo_id=pick_object_v5
+        #       --dataset.root=./data/pick_object_v5
         repo_path = Path(dataset_repo_id)
         if repo_path.exists():
-            repo_id = repo_path.name          # "pick_object_v5"
-            root    = str(repo_path.parent)   # "./data"
+            repo_id = repo_path.name       # "pick_object_v5"
+            root    = str(repo_path)       # "./data/pick_object_v5"
         else:
             # Treat as a HuggingFace repo id (e.g. "user/dataset")
             repo_id = dataset_repo_id
