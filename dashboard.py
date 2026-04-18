@@ -1,26 +1,6 @@
-"""
-dashboard.py — SkillPatch live execution monitor
-
-Renders a live Streamlit view of SkillPatch execution state (500ms refresh).
-Trace I/O utilities (log_event, read_trace, clear_trace) live in
-tinyvla_debugger.trace_logger and are imported here for convenience.
-
-trace.jsonl schema (one JSON object per line):
-  {
-    "timestamp":      float,        # Unix time, e.g. 1713361391.44
-    "skill":          str,          # e.g. "stock_middle_shelf"
-    "step_id":        int | null,   # null for skill-level events
-    "action":         str,          # e.g. "pick_from_box"
-    "result":         str,          # "PASS" | "FAIL" | "PATCHED" |
-                                    # "ABORT" | "running" | "skill_complete"
-    "failure_type":   str | null,   # e.g. "GRASP_FAIL" or null
-    "patch_applied":  dict | null,  # e.g. {"z_offset_mm": 5} or null
-    "gpu_latency_ms": float | null, # VLM inference latency in ms (ROCm iGPU)
-    "retry":          bool          # True if this is a retry attempt
-  }
-"""
-
-from __future__ import annotations
+# The purpose of this module is to provide a live view of the SkillPatch execution state.
+# It reads trace.jsonl and patches.json every 500ms and displays robot step status,
+# the ReAct agentic loop phase, NPU vs CPU latency, execution history, and patch memory.
 
 import json
 from datetime import datetime
@@ -30,12 +10,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from python.tinyvla_debugger.trace_logger import log_event, read_trace, clear_trace  # noqa: F401
-
 TRACE_FILE   = Path("trace.jsonl")
 PATCHES_FILE = Path("patches.json")
 
-GPU_TARGET_MS   = 120.0
+NPU_TARGET_MS   = 120.0
 CPU_BASELINE_MS = 820.0
 
 SKILL_STEPS = [
@@ -63,16 +41,11 @@ REACT_PHASES = [
 ]
 
 
-# ── trace I/O utilities ────────────────────────────────────────────────────────
-# log_event, read_trace, clear_trace live in tinyvla_debugger.trace_logger —
-# imported above so dashboard callers and the orchestrator share one implementation.
-
 def load_trace() -> list[dict]:
-    """Read all events from trace.jsonl, oldest first. Used internally by the dashboard."""
     if not TRACE_FILE.exists():
         return []
     events = []
-    with open(TRACE_FILE, encoding="utf-8") as f:
+    with open(TRACE_FILE) as f:
         for line in f:
             line = line.strip()
             if line:
@@ -111,8 +84,6 @@ def get_active_react_phases(events: list[dict]) -> set[str]:
         return {"REFLECT"}
     return {"PLAN"}
 
-
-# ── Streamlit app ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="SkillPatch", layout="wide", initial_sidebar_state="collapsed")
 
@@ -159,7 +130,7 @@ with col_badge:
 <div style='text-align:right; padding-top:6px;'>
     <span style='background:#ED1C24; color:white; padding:3px 10px;
                  border-radius:4px; font-size:0.75rem; font-weight:600;'>
-        AMD Ryzen AI ROCm iGPU
+        AMD Ryzen AI NPU
     </span><br/>
     <span style='color:#8892A4; font-size:0.72rem;'>Moondream2 INT4 · Phi-3-mini · LeRobot SO-100</span>
 </div>""", unsafe_allow_html=True)
@@ -274,14 +245,14 @@ def live_dashboard() -> None:
 </div>""", unsafe_allow_html=True)
 
     with col_b:
-        latency_events = [e for e in events if e.get("gpu_latency_ms") is not None]
+        latency_events = [e for e in events if e.get("npu_latency_ms") is not None]
         if not latency_events:
-            ms_str, speedup_str, color, backend = "— ms", "—× vs CPU", "#4A5568", "ROCm iGPU"
+            ms_str, speedup_str, color, backend = "— ms", "—× vs CPU", "#4A5568", "NPU"
         else:
-            ms      = latency_events[-1]["gpu_latency_ms"]
-            backend = latency_events[-1].get("backend", "ROCm iGPU")
+            ms      = latency_events[-1]["npu_latency_ms"]
+            backend = latency_events[-1].get("backend", "NPU")
             speedup = CPU_BASELINE_MS / ms
-            color   = "#00D4AA" if ms < GPU_TARGET_MS else "#FF8C00"
+            color   = "#00D4AA" if ms < NPU_TARGET_MS else "#FF8C00"
             ms_str      = f"{ms:.1f} ms"
             speedup_str = f"{speedup:.1f}× faster than CPU"
         st.markdown(f"""
@@ -324,16 +295,16 @@ def live_dashboard() -> None:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # ── ROCm iGPU latency charts ───────────────────────────────────────────────
-    latency_events = [e for e in events if e.get("gpu_latency_ms") is not None]
+    # ── NPU latency charts ────────────────────────────────────────────────────
+    latency_events = [e for e in events if e.get("npu_latency_ms") is not None]
     col_bar, col_trend = st.columns(2)
 
     with col_bar:
-        live_ms   = latency_events[-1]["gpu_latency_ms"] if latency_events else GPU_TARGET_MS
-        bar_color = "#00D4AA" if live_ms < GPU_TARGET_MS else "#FF8C00"
+        live_ms   = latency_events[-1]["npu_latency_ms"] if latency_events else NPU_TARGET_MS
+        bar_color = "#00D4AA" if live_ms < NPU_TARGET_MS else "#FF8C00"
         fig = go.Figure(go.Bar(
             x=[live_ms, CPU_BASELINE_MS],
-            y=["ROCm iGPU (live)", "CPU only"],
+            y=["NPU (live)", "CPU only"],
             orientation="h",
             marker_color=[bar_color, "#4A5568"],
             text=[f"{live_ms:.1f} ms", f"{CPU_BASELINE_MS:.0f} ms  (too slow for real-time)"],
@@ -341,7 +312,7 @@ def live_dashboard() -> None:
             textfont=dict(color="#F0F2F6"),
         ))
         fig.update_layout(
-            title=dict(text="ROCm iGPU vs CPU — real-time threshold is 120ms", font=dict(color="#8892A4", size=12)),
+            title=dict(text="NPU vs CPU — real-time threshold is 120ms", font=dict(color="#8892A4", size=12)),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             xaxis=dict(range=[0, CPU_BASELINE_MS * 1.25], color="#8892A4",
                        showgrid=True, gridcolor="#2D3748"),
@@ -352,18 +323,18 @@ def live_dashboard() -> None:
 
     with col_trend:
         if len(latency_events) > 1:
-            recent = [e["gpu_latency_ms"] for e in latency_events[-40:]]
+            recent = [e["npu_latency_ms"] for e in latency_events[-40:]]
             fig2 = go.Figure(go.Scatter(
                 y=recent, mode="lines",
                 line=dict(color="#ED1C24", width=2),
                 fill="tozeroy", fillcolor="rgba(237,28,36,0.1)",
             ))
-            fig2.add_hline(y=GPU_TARGET_MS,
+            fig2.add_hline(y=NPU_TARGET_MS,
                            line=dict(color="#FF8C00", dash="dash", width=1),
                            annotation_text="120ms target",
                            annotation_font_color="#FF8C00")
             fig2.update_layout(
-                title=dict(text="ROCm iGPU latency trend (last 40 inferences)", font=dict(color="#8892A4", size=12)),
+                title=dict(text="NPU latency trend (last 40 inferences)", font=dict(color="#8892A4", size=12)),
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 xaxis=dict(color="#8892A4", showgrid=False),
                 yaxis=dict(color="#8892A4", showgrid=True, gridcolor="#2D3748"),
@@ -394,7 +365,7 @@ def live_dashboard() -> None:
                 "Result":  e.get("result", "—"),
                 "Failure": e.get("failure_type") or "—",
                 "Patch":   str(e.get("patch_applied") or "—"),
-                "GPU ms":  f"{e['gpu_latency_ms']:.1f}" if e.get("gpu_latency_ms") else "—",
+                "NPU ms":  f"{e['npu_latency_ms']:.1f}" if e.get("npu_latency_ms") else "—",
             })
 
         def _color(val: str) -> str:
