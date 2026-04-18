@@ -28,7 +28,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,31 +36,25 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
-# All valid action names — original shelf-stocking primitives + new robot API skills.
-# Diya's robot_api.replay_skill() must handle all of these.
+# The four skills robot_api.replay_skill() handles directly by name.
+# These are the only valid action values in a compiled skill program.
 VALID_ACTIONS = {
-    # Original shelf-stocking primitives
-    "scan_shelf",
-    "pick_from_box",
-    "place_slot_1",
-    "place_slot_2",
-    "place_slot_3",
-    "check_box_empty",
-    # New robot API skill primitives (robot_api.py — Diya)
-    "scan_scene",      # general workspace scan: locate objects in view
-    "pick_object",     # pick an object from arbitrary scene position (not from box)
-    "place_in_box",    # place held object into a box
-    "move_box_to_shelf",  # grasp a box and set it onto the shelf
+    "pick_object",        # pick an object from the scene into the gripper
+    "place_in_box",       # place whatever is in the gripper into the target box
+    "full_pick_and_place", # pick an object and place it in the box in one motion
+    "box_in_shelf",       # pick up a box and place it upright in a shelf slot
 }
 
 SKILL_PROGRAM_SCHEMA = {
-    "skill_name": "string (snake_case identifier)",
+    "skill_name": "string (snake_case identifier for this high-level task)",
     "description": "string",
     "steps": [
         {
             "step_id": "int (0-indexed)",
-            "action": f"string — one of: {', '.join(sorted(VALID_ACTIONS))}",
-            "verification_query": "string — yes/no question about the scene",
+            "action": f"string — one of: {' | '.join(sorted(VALID_ACTIONS))}",
+            "verification_query": (
+                "string — yes/no question the VLM checks after this skill completes"
+            ),
             "expected_result": "bool",
         }
     ],
@@ -121,9 +115,9 @@ SKILL_REGISTRY: dict[str, dict] = {
             },
             {
                 "step_id": 1,
-                "action": "check_box_empty",
-                "verification_query": "Is the box still empty?",
-                "expected_result": False,   # box should NOT be empty after placement
+                "action": "scan_scene",
+                "verification_query": "Is the box now occupied with the placed object?",
+                "expected_result": True,
             },
         ],
         "parameters": dict(_DEFAULT_PARAMS),
@@ -159,7 +153,7 @@ SKILL_REGISTRY: dict[str, dict] = {
         "steps": [
             {
                 "step_id": 0,
-                "action": "scan_shelf",
+                "action": "scan_scene",
                 "verification_query": "Is there an empty slot visible on the shelf?",
                 "expected_result": True,
             },
@@ -180,75 +174,99 @@ SKILL_REGISTRY: dict[str, dict] = {
     },
 }
 
+
 # ---------------------------------------------------------------------------
 # System prompt (load-bearing — do not shorten)
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """\
-You are a robot skill compiler. You convert natural language shelf-stocking \
-commands into structured skill programs for a LeRobot arm.
+You are a robot skill compiler for a LeRobot arm. You translate natural language \
+commands into high-level skill programs.
 
-OUTPUT SCHEMA — your response must be a single JSON object matching this exactly:
+HOW IT WORKS
+The robot has four reusable sub-skills. Each step in your output invokes one of \
+them by name. The robot executes the sub-skill autonomously; then the VLM checks \
+your verification_query against the live camera feed before moving to the next step.
+
+AVAILABLE SUB-SKILLS — every step's "action" must be exactly one of these:
+  pick_object        — locate an object in the scene and pick it up into the gripper
+  place_in_box       — place whatever the gripper is holding into the target box
+  full_pick_and_place — pick an object from the scene and place it directly into the box
+  box_in_shelf       — pick up a box and place it upright in an empty shelf slot
+
+PARAMETERS — shared across all steps; tune only when the command implies it:
+  z_offset_mm         float   vertical approach offset in mm          default 0
+  speed_scale         float   replay speed multiplier                  default 1.0
+  approach_angle_deg  float   wrist rotation offset in degrees         default 0
+  gripper_close_force float   grip strength 0.0–1.0                   default 0.6
+  retry_count         int     max automatic retries per step           default 2
+
+OUTPUT SCHEMA — respond with a single JSON object matching this exactly:
 {
-  "skill_name": "<snake_case identifier for this skill>",
-  "description": "<one sentence describing what this skill does>",
+  "skill_name": "<snake_case name for this overall task>",
+  "description": "<one sentence describing the full task>",
   "steps": [
     {
       "step_id": <int, 0-indexed>,
-      "action": "<one of: scan_shelf | scan_scene | pick_from_box | pick_object | place_slot_1 | place_slot_2 | place_slot_3 | place_in_box | move_box_to_shelf | check_box_empty>",
-      "verification_query": "<yes/no question the VLM will check after this step>",
+      "action": "<pick_object | place_in_box | full_pick_and_place | box_in_shelf>",
+      "verification_query": "<yes/no question the VLM checks after this sub-skill completes>",
       "expected_result": <true | false>
     }
   ],
   "parameters": {
-    "z_offset_mm": <float, default 0>,
-    "speed_scale": <float, default 1.0>,
-    "approach_angle_deg": <float, default 0>,
-    "gripper_close_force": <float, default 0.6>,
-    "retry_count": <int, default 2>
+    "z_offset_mm": <float>,
+    "speed_scale": <float>,
+    "approach_angle_deg": <float>,
+    "gripper_close_force": <float>,
+    "retry_count": <int>
   }
 }
 
 CANONICAL EXAMPLES:
 
-Example 1 — "Put the canned goods on the middle shelf":
+Example 1 — "Refill the inventory":
 {
-  "skill_name": "stock_middle_shelf",
-  "description": "Pick items from source box, place on middle shelf slots",
+  "skill_name": "refill_inventory",
+  "description": "Pick all loose objects from the scene, place them in the box, then shelve the box.",
   "steps": [
-    {"step_id": 0, "action": "scan_shelf", "verification_query": "Are there empty slots visible on the middle shelf?", "expected_result": true},
-    {"step_id": 1, "action": "pick_from_box", "verification_query": "Is an object held securely in the gripper?", "expected_result": true},
-    {"step_id": 2, "action": "place_slot_1", "verification_query": "Is there an item standing upright in shelf slot 1?", "expected_result": true},
-    {"step_id": 3, "action": "check_box_empty", "verification_query": "Is the source box empty?", "expected_result": true}
+    {"step_id": 0, "action": "full_pick_and_place", "verification_query": "Is there at least one object now inside the box?",          "expected_result": true},
+    {"step_id": 1, "action": "full_pick_and_place", "verification_query": "Are there any remaining loose objects visible in the scene?", "expected_result": false},
+    {"step_id": 2, "action": "box_in_shelf",         "verification_query": "Is the box now standing upright on the shelf?",              "expected_result": true}
   ],
   "parameters": {"z_offset_mm": 0, "speed_scale": 1.0, "approach_angle_deg": 0, "gripper_close_force": 0.6, "retry_count": 2}
 }
 
-Example 2 — "Refill slot 2 only":
+Example 2 — "Pick up the item and store it":
 {
-  "skill_name": "refill_slot_2",
-  "description": "Pick one item from source box and place it in shelf slot 2",
+  "skill_name": "pick_and_store",
+  "description": "Pick an object from the scene and deposit it into the storage box.",
   "steps": [
-    {"step_id": 0, "action": "pick_from_box", "verification_query": "Is an object held securely in the gripper?", "expected_result": true},
-    {"step_id": 1, "action": "place_slot_2", "verification_query": "Is there an item standing upright in shelf slot 2?", "expected_result": true}
+    {"step_id": 0, "action": "pick_object",  "verification_query": "Is an object held securely in the gripper?",  "expected_result": true},
+    {"step_id": 1, "action": "place_in_box", "verification_query": "Is the object now inside the box?",           "expected_result": true}
   ],
   "parameters": {"z_offset_mm": 0, "speed_scale": 1.0, "approach_angle_deg": 0, "gripper_close_force": 0.6, "retry_count": 2}
 }
 
-Example 3 — "Stock slots 1 and 2":
+Example 3 — "Stock the shelf":
 {
-  "skill_name": "stock_slots_1_and_2",
-  "description": "Pick and place items into shelf slots 1 and 2 sequentially",
+  "skill_name": "stock_shelf",
+  "description": "Pick and place objects into the box until none remain, then move the box onto the shelf.",
   "steps": [
-    {"step_id": 0, "action": "scan_shelf", "verification_query": "Are slots 1 and 2 empty?", "expected_result": true},
-    {"step_id": 1, "action": "pick_from_box", "verification_query": "Is an object held securely in the gripper?", "expected_result": true},
-    {"step_id": 2, "action": "place_slot_1", "verification_query": "Is there an item standing upright in shelf slot 1?", "expected_result": true},
-    {"step_id": 3, "action": "pick_from_box", "verification_query": "Is an object held securely in the gripper?", "expected_result": true},
-    {"step_id": 4, "action": "place_slot_2", "verification_query": "Is there an item standing upright in shelf slot 2?", "expected_result": true},
-    {"step_id": 5, "action": "check_box_empty", "verification_query": "Is the source box empty?", "expected_result": true}
+    {"step_id": 0, "action": "full_pick_and_place", "verification_query": "Is there at least one object now inside the box?",           "expected_result": true},
+    {"step_id": 1, "action": "box_in_shelf",         "verification_query": "Is the box now placed upright in a shelf slot?",             "expected_result": true}
   ],
   "parameters": {"z_offset_mm": 0, "speed_scale": 1.0, "approach_angle_deg": 0, "gripper_close_force": 0.6, "retry_count": 2}
 }
+
+RULES:
+- Use only the four listed sub-skill names. Never invent new action names.
+- Sequence steps so each sub-skill's precondition is satisfied by the previous step \
+(e.g. place_in_box assumes the gripper is already holding something; use pick_object first).
+- verification_query must be a yes/no question answerable from a single camera frame.
+- Use expected_result: false when the correct state is an absence (e.g. "no loose objects remain").
+- Repeat a sub-skill in consecutive steps when the command implies multiple objects.
+- Adjust parameters only when the natural language implies it \
+(e.g. "gently" → gripper_close_force: 0.3, "slowly" → speed_scale: 0.5).
 
 Respond ONLY with valid JSON matching this schema. No other text. No markdown. No explanation.\
 """
@@ -348,9 +366,13 @@ class SkillCompiler:
     def _init_backend(
         self, backend: BackendType, model_path: str | None
     ) -> tuple[str, Any]:
+        # [MOCK] Explicit mock request — skip hardware detection entirely.
         if backend == "mock":
             return "mock", self._mock_engine
 
+        # [REAL] Primary path: Phi-3-mini-4k GGUF via llama-cpp-python (ROCm/HIP).
+        # Setup: CMAKE_ARGS="-DGGML_HIPBLAS=on" pip install llama-cpp-python
+        #        download Phi-3-mini-4k-instruct-q4.gguf, set PHI3_GGUF_PATH.
         if backend in ("llama_cpp", "auto"):
             result = self._try_llama_cpp(model_path)
             if result is not None:
@@ -361,6 +383,9 @@ class SkillCompiler:
                     "or model not found. Run: pip install llama-cpp-python"
                 )
 
+        # [REAL] Secondary path: Phi-3-mini ONNX via onnxruntime-rocm.
+        # Setup: pip install onnxruntime-rocm transformers tokenizers
+        #        set PHI3_ONNX_PATH to the converted model directory.
         if backend in ("onnx_rocm", "auto"):
             result = self._try_onnx_rocm(model_path)
             if result is not None:
@@ -371,11 +396,12 @@ class SkillCompiler:
                     "or model not found. Run: pip install onnxruntime-rocm"
                 )
 
-        # auto fell through — use mock with a clear warning
+        # [MOCK] auto fell through — neither real backend found.
+        # Output is deterministic keyword routing, NOT Phi-3 inference.
         logger.warning(
             "No GPU backend available (llama_cpp or onnx_rocm). "
-            "Falling back to MOCK compiler — output is deterministic test data, "
-            "not real Phi-3 inference. Set PHI3_GGUF_PATH or install llama-cpp-python."
+            "Falling back to [MOCK] compiler — keyword routing only, not real Phi-3. "
+            "Set PHI3_GGUF_PATH or install llama-cpp-python for real inference."
         )
         return "mock", self._mock_engine
 
@@ -400,6 +426,9 @@ class SkillCompiler:
         )
 
         def engine(nl_command: str) -> str:
+            # Do NOT pass response_format={"type": "json_object"} — the generic
+            # JSON grammar suppresses Phi-3's content generation and produces {}.
+            # The system prompt + _parse_and_validate handle cleanup instead.
             response = llm.create_chat_completion(
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
@@ -407,7 +436,6 @@ class SkillCompiler:
                 ],
                 temperature=self.temperature,
                 max_tokens=1024,
-                response_format={"type": "json_object"},
             )
             return response["choices"][0]["message"]["content"]
 
@@ -463,58 +491,68 @@ class SkillCompiler:
 
     def _mock_engine(self, nl_command: str) -> str:
         """
-        Returns a deterministic skill program based on keywords in the command.
-        NOT Phi-3 inference — for development and CI only.
+        [MOCK] Deterministic keyword-based skill compiler.
 
-        TODO: HARDWARE — this entire method is mock data. In production the
-        llama_cpp or onnx_rocm engine is used instead (see _init_backend).
-        This only runs when neither backend is available or backend="mock".
+        Returns a valid compiled skill program without invoking Phi-3.
+        Used when backend="mock" or when no GPU backend is available.
+        Output is keyword routing — it will be wrong for ambiguous commands.
+
+        [REAL] In production this method is never called. The llama_cpp or
+        onnx_rocm engine (see _init_backend) handles all compilation via
+        actual Phi-3-mini-4k-instruct inference on the AMD ROCm GPU.
         """
         cmd = nl_command.lower()
 
-        # Detect slot-specific commands
-        slots: list[int] = []
-        for i in (1, 2, 3):
-            if str(i) in cmd or ("one" == cmd.split()[-1] and i == 1):
-                slots.append(i)
-        if not slots:
-            slots = [1, 2]  # default: fill slots 1 and 2
+        # Keyword routing → assemble registry-skill steps that match the intent.
+        # Priority tiers (checked in order, first match wins):
+        #   1. shelf + restock commands  → full workflow ending with box_in_shelf
+        #   2. "just shelve the box"     → box_in_shelf only
+        #   3. place / deposit only      → place_in_box only (gripper already full)
+        #   4. pick only (no destination mentioned)
+        #   5. default                   → full_pick_and_place
 
-        steps = [
-            {
-                "step_id": 0,
-                "action": "scan_shelf",
-                "verification_query": "Are there empty slots visible on the shelf?",
-                "expected_result": True,
-            }
-        ]
-        step_id = 1
-        for slot in slots:
-            steps.append({
-                "step_id": step_id,
-                "action": "pick_from_box",
-                "verification_query": "Is an object held securely in the gripper?",
-                "expected_result": True,
-            })
-            step_id += 1
-            steps.append({
-                "step_id": step_id,
-                "action": f"place_slot_{slot}",
-                "verification_query": f"Is there an item standing upright in shelf slot {slot}?",
-                "expected_result": True,
-            })
-            step_id += 1
-        steps.append({
-            "step_id": step_id,
-            "action": "check_box_empty",
-            "verification_query": "Is the source box empty?",
-            "expected_result": True,
-        })
-
-        skill_name = "stock_shelf_mock"
-        if "slot" in cmd:
-            slot_str = "_".join(f"slot_{s}" for s in slots)
-            skill_name = f"stock_{slot_str}_mock"
+        if any(kw in cmd for kw in ("refill", "restock", "inventory", "stock")):
+            skill_name = "refill_inventory_mock"
+            steps = [
+                {"step_id": 0, "action": "full_pick_and_place",
+                 "verification_query": "Is there at least one object now inside the box?",
+                 "expected_result": True},
+                {"step_id": 1, "action": "full_pick_and_place",
+                 "verification_query": "Are there any remaining loose objects visible in the scene?",
+                 "expected_result": False},
+                {"step_id": 2, "action": "box_in_shelf",
+                 "verification_query": "Is the box now standing upright on the shelf?",
+                 "expected_result": True},
+            ]
+        elif any(kw in cmd for kw in ("shelf", "shelve", "shelving")):
+            skill_name = "shelve_box_mock"
+            steps = [
+                {"step_id": 0, "action": "box_in_shelf",
+                 "verification_query": "Is the box now standing upright on the shelf?",
+                 "expected_result": True},
+            ]
+        elif any(kw in cmd for kw in ("place", "put in box", "drop", "deposit", "release")):
+            skill_name = "place_in_box_mock"
+            steps = [
+                {"step_id": 0, "action": "place_in_box",
+                 "verification_query": "Is the object now inside the box?",
+                 "expected_result": True},
+            ]
+        elif any(kw in cmd for kw in ("pick up", "pick", "grab", "grasp", "get", "fetch")):
+            skill_name = "pick_object_mock"
+            steps = [
+                {"step_id": 0, "action": "pick_object",
+                 "verification_query": "Is an object held securely in the gripper?",
+                 "expected_result": True},
+            ]
+        else:
+            # Default: pick an object and place it in the box
+            skill_name = "pick_and_place_mock"
+            steps = [
+                {"step_id": 0, "action": "full_pick_and_place",
+                 "verification_query": "Is the object now inside the box?",
+                 "expected_result": True},
+            ]
 
         return json.dumps({
             "skill_name": skill_name,
@@ -542,6 +580,10 @@ class SkillCompiler:
             cleaned = re.sub(r"\s*```$", "", cleaned)
             cleaned = cleaned.strip()
 
+        # Extract the first complete {...} JSON object.
+        # Phi-3 sometimes appends "Note: ..." text after the JSON — this strips it.
+        cleaned = self._extract_first_json_object(cleaned)
+
         try:
             skill = json.loads(cleaned)
         except json.JSONDecodeError as e:
@@ -551,8 +593,83 @@ class SkillCompiler:
                 f"Error: {e}"
             ) from e
 
-        self._validate_schema(skill)
+        # Auto-unwrap: if required fields are missing the model may have wrapped
+        # the program in a parent object (e.g. {"skill_program": {...}}).
+        # Search recursively up to 3 levels deep for a dict that contains at
+        # least one required field rather than requiring an exact single-child match.
+        required_top = {"skill_name", "description", "steps", "parameters"}
+        if not (required_top & skill.keys()):
+            candidate = self._find_skill_dict(skill, required_top, depth=3)
+            if candidate is not None:
+                logger.debug(
+                    "Auto-unwrapping nested skill program (found at depth > 0)"
+                )
+                skill = candidate
+
+        try:
+            self._validate_schema(skill)
+        except ValueError as exc:
+            # Re-raise with the raw model output attached so debugging is possible.
+            raise ValueError(
+                f"{exc}\n"
+                f"Parsed JSON: {json.dumps(skill, indent=2)}\n"
+                f"Raw model output: {raw!r}"
+            ) from exc
         return skill
+
+    @staticmethod
+    def _find_skill_dict(
+        obj: dict, required_top: set, depth: int
+    ) -> "dict | None":
+        """
+        Recursively search *obj* for a nested dict that contains at least one
+        key from *required_top*.  Returns the best match (most required keys
+        present) found within *depth* levels, or None if nothing is found.
+        """
+        if depth == 0:
+            return None
+        best: dict | None = None
+        best_score = 0
+        for v in obj.values():
+            if not isinstance(v, dict):
+                continue
+            score = len(required_top & v.keys())
+            if score > best_score:
+                best_score = score
+                best = v
+            # Recurse
+            deeper = SkillCompiler._find_skill_dict(v, required_top, depth - 1)
+            if deeper is not None:
+                deeper_score = len(required_top & deeper.keys())
+                if deeper_score > best_score:
+                    best_score = deeper_score
+                    best = deeper
+        return best if best_score > 0 else None
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> str:
+        """
+        Return the first complete ``{...}`` JSON object found in *text*.
+
+        Phi-3 occasionally appends a "Note: ..." sentence after the closing
+        brace.  This method finds the balanced closing brace and truncates
+        anything after it, so ``json.loads`` receives clean input.
+
+        Falls back to returning *text* unchanged if no complete object is
+        found (the subsequent ``json.loads`` call will raise the right error).
+        """
+        depth = 0
+        start: Optional[int] = None
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if start is None:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start is not None:
+                    return text[start : i + 1]
+        return text  # no complete object — return as-is
 
     def _validate_schema(self, skill: dict) -> None:
         """Raise ValueError if required fields are missing or malformed."""
@@ -569,6 +686,12 @@ class SkillCompiler:
             missing_step = required_step - step.keys()
             if missing_step:
                 raise ValueError(f"Step {i} missing fields: {missing_step}")
+            action = step.get("action", "")
+            if action not in VALID_ACTIONS:
+                raise ValueError(
+                    f"Step {i} has unknown action {action!r}. "
+                    f"Must be one of: {sorted(VALID_ACTIONS)}"
+                )
 
         required_params = {
             "z_offset_mm", "speed_scale", "approach_angle_deg",

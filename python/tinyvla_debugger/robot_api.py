@@ -1,17 +1,26 @@
 """
-robot_api.py — Robot hardware interface stub
+robot_api.py — Robot hardware interface
 Owner: Diya
 
-Exposes exactly three functions that every other module codes against.
-Do NOT add extra functions here — the orchestrator, tests, and mocks
-all depend on this exact interface.
+# [STUB] — all three public functions raise NotImplementedError.
+# Replace each body with the real LeRobot/SO-100 implementation.
+# The rest of the codebase (orchestrator, tests, mocks) codes against
+# this interface — do NOT change function signatures or StepEvent fields.
 
-Integration note for Diya:
+Integration notes for Diya:
   - replay_skill must yield a StepEvent AFTER each motion step completes,
     not before. The orchestrator calls vlm_api.verify() immediately after
     each yield, so timing matters.
-  - apply_patch modifies the stored trajectory parameters on disk so that
-    the next replay_skill call picks them up automatically.
+  - The four skill names robot_api must handle are exactly:
+      "pick_object", "place_in_box", "full_pick_and_place", "box_in_shelf"
+    These match SKILL_REGISTRY keys in compiler.py.
+  - apply_patch modifies stored trajectory parameters on disk so the next
+    replay_skill call picks them up automatically.
+
+To swap in the real implementation at runtime, pass the module to the orchestrator:
+    import robot_api
+    orc = Orchestrator(robot=robot_api)   # uses real hardware
+    orc = Orchestrator(robot=MockRobotAPI())  # uses mock (testing)
 """
 
 from __future__ import annotations
@@ -46,14 +55,14 @@ def record_skill(skill_name: str) -> None:
     trajectory of the follower arm is saved to disk under `skill_name`.
 
     Args:
-        skill_name: Snake-case identifier, e.g. "pick_from_box".
+        skill_name: One of "pick_object", "place_in_box",
+                    "full_pick_and_place", "box_in_shelf".
 
-    Raises:
-        NotImplementedError: Until Diya's implementation lands.
+    # [STUB] Replace body with LeRobot teleoperation recording.
+    # Example: use lerobot.record() with the SO-100 arm config.
     """
     raise NotImplementedError(
-        "robot_api.record_skill not yet implemented — waiting for Diya. "
-        "Use a mock in tests."
+        "robot_api.record_skill — [STUB] awaiting Diya's LeRobot implementation."
     )
 
 
@@ -61,52 +70,48 @@ def replay_skill(skill_name: str, params: dict) -> Iterator[StepEvent]:
     """
     Replay a previously recorded skill trajectory.
 
-    Applies `params` adjustments to the stored trajectory (z_offset_mm,
-    speed_scale, approach_angle_deg, gripper_close_force, retry_count)
-    then executes step-by-step on the follower arm, yielding a StepEvent
-    after EACH step completes.
-
-    The orchestrator calls vlm_api.verify() after each yield, so this
-    generator must pause between steps until the caller resumes it.
+    Applies `params` adjustments to the stored trajectory, then executes
+    step-by-step on the follower arm, yielding a StepEvent after EACH
+    step completes. The orchestrator calls vlm_api.verify() after each
+    yield, so this generator must pause between steps until resumed.
 
     Args:
-        skill_name: Snake-case identifier matching a recorded trajectory.
-        params:     Dict with any subset of patchable parameters:
-                      z_offset_mm        (float) vertical approach offset in mm
-                      speed_scale        (float) replay speed multiplier, default 1.0
-                      approach_angle_deg (float) wrist approach rotation in degrees
-                      gripper_close_force(float) grip strength, 0.0–1.0
-                      retry_count        (int)   max automatic retries per step
+        skill_name: One of "pick_object", "place_in_box",
+                    "full_pick_and_place", "box_in_shelf".
+        params:     Patchable parameters (all optional, defaults apply):
+                      z_offset_mm         float  vertical approach offset in mm
+                      speed_scale         float  replay speed multiplier
+                      approach_angle_deg  float  wrist rotation in degrees
+                      gripper_close_force float  grip strength 0.0–1.0
+                      retry_count         int    max retries per step
 
     Yields:
-        StepEvent for each completed motion step.
+        StepEvent after each completed motion step.
 
-    Raises:
-        NotImplementedError: Until Diya's implementation lands.
+    # [STUB] Replace body with LeRobot trajectory replay.
+    # Example: use lerobot.replay() with patched params applied to the
+    # stored trajectory config before playback.
     """
     raise NotImplementedError(
-        "robot_api.replay_skill not yet implemented — waiting for Diya. "
-        "Use a mock in tests."
+        "robot_api.replay_skill — [STUB] awaiting Diya's LeRobot implementation."
     )
-    # Unreachable; satisfies type checkers that expect Iterator[StepEvent]
-    yield StepEvent(step_id=0, action="", timestamp=0.0, gripper_state="unknown")
+    yield StepEvent(step_id=0, action="", timestamp=0.0, gripper_state="unknown")  # noqa: unreachable
 
 
 def apply_patch(skill_name: str, patch: dict) -> None:
     """
-    Persist parameter deltas to the stored trajectory before next replay.
+    Persist parameter deltas to the stored trajectory config.
 
-    Modifies the on-disk trajectory metadata so subsequent calls to
-    replay_skill automatically incorporate the patch without re-recording.
+    Modifies on-disk trajectory metadata so subsequent replay_skill calls
+    automatically incorporate the patch without re-recording.
 
     Args:
-        skill_name: Snake-case identifier matching a recorded trajectory.
-        patch:      Dict of parameter deltas, e.g. {"z_offset_mm": 5}.
+        skill_name: One of the four canonical skill names.
+        patch:      Parameter deltas, e.g. {"gripper_close_force": 0.8}.
 
-    Raises:
-        NotImplementedError: Until Diya's implementation lands.
+    # [STUB] Replace body with a write to the LeRobot trajectory config file.
+    # Example: load the YAML/JSON config for skill_name, merge patch, save.
     """
     raise NotImplementedError(
-        "robot_api.apply_patch not yet implemented — waiting for Diya. "
-        "Use a mock in tests."
+        "robot_api.apply_patch — [STUB] awaiting Diya's LeRobot implementation."
     )

@@ -42,7 +42,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional, Protocol
+from typing import Any, Callable, Iterator, Optional, Protocol
 
 import cv2  # webcam capture — pip install opencv-python-headless
 
@@ -133,7 +133,11 @@ class Orchestrator:
         trace_file: Optional[str] = None,
         webcam_index: int = 0,
         audio: Optional[AudioFeedback] = None,
+        frame_source: Optional[Callable[[], Any]] = None,
     ) -> None:
+        # Optional external frame provider (e.g. WebcamStream.get_latest_frame).
+        # When set, _capture_frame() delegates here instead of opening VideoCapture.
+        self._frame_source = frame_source
         # Layer 1
         self.compiler = SkillCompiler(backend=compiler_backend)
 
@@ -432,7 +436,19 @@ class Orchestrator:
             pass  # events are logged inside robot_api; orchestrator gets them on yield
 
     def _capture_frame(self):
-        """Capture a single frame from the webcam."""
+        """
+        Return the latest webcam frame.
+
+        If a frame_source callable was provided at construction (e.g. from
+        WebcamStream.get_latest_frame), it is called directly — the camera
+        stays open in its background thread and this is just a dict lookup.
+
+        Otherwise, falls back to the original open-read-release pattern so
+        the orchestrator remains usable without WebcamStream.
+        """
+        if self._frame_source is not None:
+            return self._frame_source()
+
         cap = cv2.VideoCapture(self._webcam_index)
         ret, frame = cap.read()
         cap.release()
@@ -494,20 +510,30 @@ class Orchestrator:
 
 
 # ---------------------------------------------------------------------------
-# Mock implementations for pre-integration testing
+# [MOCK] Test doubles — used when running with --mock or in unit tests.
+#
+# To switch to real hardware, pass the real modules to Orchestrator:
+#   import robot_api, vlm_api
+#   orc = Orchestrator(robot=robot_api, vlm=vlm_api)   # [REAL]
+#   orc = Orchestrator(robot=MockRobotAPI(), vlm=MockVLMAPI())  # [MOCK]
 # ---------------------------------------------------------------------------
 
 class MockRobotAPI:
     """
-    Mock robot_api for testing orchestration logic without hardware.
+    [MOCK] Simulates robot_api without hardware.
 
-    TODO: HARDWARE — replace with real robot_api (Diya) when available.
-    Swap by passing robot_api module directly to Orchestrator(robot=...).
+    Yields synthetic StepEvents and records applied patches in memory.
+    Use failure_on_step to inject a gripper failure on a specific step,
+    which exercises the classifier → patch → retry path in the orchestrator.
+
+    [REAL] Replace by passing the real robot_api module:
+        from tinyvla_debugger import robot_api
+        orc = Orchestrator(robot=robot_api)
 
     Args:
-        failure_on_step: Step ID that should "fail" (gripper doesn't close).
-                         Set to -1 for no failures.
-        num_steps:       How many steps to emit per replay_skill call.
+        failure_on_step: Step index whose gripper_state is forced "open"
+                         (simulates a grasp failure). Set to -1 for no failures.
+        num_steps:       Steps emitted per replay_skill call.
     """
 
     def __init__(self, failure_on_step: int = -1, num_steps: int = 4) -> None:
@@ -519,63 +545,78 @@ class MockRobotAPI:
     def replay_skill(self, skill_name: str, params: dict) -> Iterator[Any]:
         from .robot_api import StepEvent
         for i in range(self.num_steps):
-            # TODO: HARDWARE — gripper_state is simulated here.
-            # Real robot_api.replay_skill() yields actual StepEvents from
-            # the SO-100 arm with live gripper sensor readings.
+            # [MOCK] gripper_state and action name are synthetic.
+            # [REAL] robot_api yields StepEvents from the SO-100 arm
+            #        with live gripper sensor readings and the actual
+            #        trajectory action name.
             gripper = "open" if i == self.failure_on_step else "closed"
             yield StepEvent(
                 step_id=i,
-                action=f"mock_action_{i}",        # TODO: HARDWARE — real action name from robot
+                action=skill_name,
                 timestamp=time.time(),
                 gripper_state=gripper,
                 params_used=dict(params),
             )
 
     def apply_patch(self, skill_name: str, patch: dict) -> None:
+        # [MOCK] Stores patch in memory only — nothing written to disk.
+        # [REAL] robot_api.apply_patch() writes deltas to the trajectory config.
         self._patches.setdefault(skill_name, {}).update(patch)
         logger.debug("MockRobotAPI.apply_patch(%s, %s)", skill_name, patch)
 
     def record_skill(self, skill_name: str) -> None:
-        logger.debug("MockRobotAPI.record_skill(%s) — no-op", skill_name)
+        # [MOCK] No-op.
+        # [REAL] robot_api.record_skill() runs LeRobot teleoperation recording.
+        logger.debug("MockRobotAPI.record_skill(%s) — no-op in mock", skill_name)
 
 
 class MockVLMAPI:
     """
-    Mock vlm_api for testing orchestration logic without ROCm GPU.
+    [MOCK] Simulates vlm_api without Ollama / ROCm GPU.
 
-    TODO: HARDWARE — replace with real vlm_api (Sasha) when available.
-    Swap by passing vlm_api module directly to Orchestrator(vlm=...).
+    By default every verify() call returns True (success). Pass step IDs
+    in fail_step_ids to make those steps fail on the first attempt and
+    pass on retry — this exercises the classifier → patch → retry path.
+
+    Note: when a real numpy frame is passed (e.g. from WebcamStream in mock
+    mode), step_id detection returns -1 and all calls succeed. To test the
+    failure path, unit tests should set frame._mock_step_id directly.
+
+    [REAL] Replace by passing the real vlm_api module:
+        from tinyvla_debugger import vlm_api
+        orc = Orchestrator(vlm=vlm_api)
+        # Requires: ollama pull moondream-verify && ollama serve
 
     Args:
-        fail_step_ids:   Set of step_ids whose verify() call returns False
-                         on the FIRST attempt. Returns True on retry.
-        latency_ms:      Simulated inference latency to report.
+        fail_step_ids: Step IDs that return False on attempt 1, True on retry.
+        latency_ms:    Simulated inference latency in milliseconds.
     """
 
     def __init__(
         self,
         fail_step_ids: set[int] | None = None,
-        latency_ms: float = 95.0,       # TODO: HARDWARE — hardcoded simulated latency;
-                                         # real vlm_api returns measured ROCm inference time
+        latency_ms: float = 95.0,   # [MOCK] hardcoded; [REAL] measured ROCm wall-clock time
     ) -> None:
         self.fail_step_ids = fail_step_ids or set()
         self.latency_ms = latency_ms
         self._call_counts: dict[int, int] = {}
 
     def verify(self, frame: Any, query: str) -> tuple[bool, float]:
-        # Infer step_id from frame (MockRobotAPI stores step_id as attribute)
+        # [MOCK] Step detection via synthetic frame attribute.
+        # Real numpy frames (WebcamStream) have no _mock_step_id → always pass.
         step_id = getattr(frame, "_mock_step_id", -1)
         count = self._call_counts.get(step_id, 0)
         self._call_counts[step_id] = count + 1
 
         if step_id in self.fail_step_ids and count == 0:
-            logger.debug("MockVLMAPI.verify — returning False (step %d, attempt 1)", step_id)
-            # TODO: HARDWARE — False here is simulated failure for testing patch path.
-            # Real vlm_api.verify() calls Moondream2 on ROCm GPU against the live frame.
+            # [MOCK] Simulated first-attempt failure to exercise patch path.
+            # [REAL] vlm_api.verify() POSTs the live frame to Moondream2 via
+            #        Ollama and parses "yes"/"no" from the model response.
+            logger.debug("MockVLMAPI.verify — step %d attempt 1 → False", step_id)
             return False, self.latency_ms
 
-        # TODO: HARDWARE — True here is simulated success.
-        # Real vlm_api.verify() returns actual model inference result + measured ms.
+        # [MOCK] Simulated success.
+        # [REAL] Returns actual Moondream2 inference result + measured latency.
         return True, self.latency_ms
 
 

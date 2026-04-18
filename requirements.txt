@@ -1,5 +1,5 @@
 # SkillPatch — Python dependencies
-# Install: pip install -r requirements.txt
+# Install: pip install -r requirements.txt --break-system-packages
 #
 # Hardware-specific packages (AMD ROCm GPU):
 #   llama-cpp-python    — requires cmake + C++ compiler; GPU build needs ROCm HIP
@@ -10,9 +10,17 @@
 #   or: ffmpeg (provides ffplay)
 
 # --- Core orchestration (Vera) ---
-# opencv for webcam capture in orchestrator
+# opencv for webcam capture in orchestrator + webcam_stream
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
+
+# --- Speech-to-text / STT (Vera) ---
+# faster-whisper: local on-device transcription (Whisper tiny/base/small/medium)
+# sounddevice: cross-platform microphone capture (requires portaudio)
+#   Linux:  sudo apt-get install -y portaudio19-dev
+#   macOS:  brew install portaudio
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
 
 # --- LLM compiler backend (Vera — pick one) ---
 # Option A: llama-cpp-python (recommended for local GPU inference)
