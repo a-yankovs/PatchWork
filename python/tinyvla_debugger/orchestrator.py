@@ -164,8 +164,8 @@ class Orchestrator:
             import os
             from .robot_api import RobotAPI
             self._robot = RobotAPI(
-                robot_port=os.environ.get("ROBOT_PORT", "/dev/ttyUSB0"),
-                teleop_port=os.environ.get("TELEOP_PORT", "/dev/ttyUSB1"),
+                robot_port=os.environ.get("ROBOT_PORT", "/dev/ttyACM1"),
+                teleop_port=os.environ.get("TELEOP_PORT", "/dev/ttyACM2"),
                 robot_id=os.environ.get("ROBOT_ID", "follower_arm"),
                 teleop_id=os.environ.get("TELEOP_ID", "leader_arm"),
                 storage_dir=os.environ.get("ROBOT_STORAGE_DIR", "./skillpatch_data"),

@@ -410,16 +410,16 @@ class RobotAPI:
 
     def _replay_single_step(self, dataset_repo_id: str, *, episode: int = 0) -> None:
         # dataset_repo_id is a local path like "./data/pick_object_v5".
-        # LeRobot Option A format:
-        #   --dataset.repo_id=pick_object_v5   (folder name only)
-        #   --dataset.root=data                (parent directory)
-        # LeRobot resolves the dataset as {root}/{repo_id}/meta/info.json internally.
-        # The specific dataset chosen here comes from the skill manifest step,
+        # LeRobot loads metadata from {root}/meta/info.json, so root must be
+        # the dataset directory itself (not its parent):
+        #   --dataset.repo_id=pick_object_v5
+        #   --dataset.root=data/pick_object_v5
+        # The specific dataset is chosen per-step from the skill manifest,
         # which is determined by the SLM-compiled skill program.
         repo_path = Path(dataset_repo_id)
         if repo_path.exists():
-            repo_id = repo_path.name        # "pick_object_v5"
-            root    = str(repo_path.parent) # "data"
+            repo_id = repo_path.name  # "pick_object_v5"
+            root    = str(repo_path)  # "data/pick_object_v5" — LeRobot loads {root}/meta/info.json
         else:
             # HuggingFace repo id (e.g. "user/dataset") — no root needed
             repo_id = dataset_repo_id

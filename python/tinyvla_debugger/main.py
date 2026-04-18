@@ -305,12 +305,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     # --- Hardware: robot arm (real mode only, ignored in --mock) ---
     import os
     parser.add_argument(
-        "--robot-port", default=os.environ.get("ROBOT_PORT", "/dev/ttyUSB0"),
-        help="Serial port for SO-100 follower arm (default: $ROBOT_PORT or /dev/ttyUSB0)",
+        "--robot-port", default=os.environ.get("ROBOT_PORT", "/dev/ttyACM1"),
+        help="Serial port for SO-100 follower arm (default: $ROBOT_PORT or /dev/ttyACM1)",
     )
     parser.add_argument(
-        "--teleop-port", default=os.environ.get("TELEOP_PORT", "/dev/ttyUSB1"),
-        help="Serial port for SO-100 leader arm (default: $TELEOP_PORT or /dev/ttyUSB1)",
+        "--teleop-port", default=os.environ.get("TELEOP_PORT", "/dev/ttyACM2"),
+        help="Serial port for SO-100 leader arm (default: $TELEOP_PORT or /dev/ttyACM2)",
     )
     parser.add_argument(
         "--robot-id", default=os.environ.get("ROBOT_ID", "follower_arm"),
