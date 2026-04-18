@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import cv2
+cv2.setLogLevel(0)  # suppress WARN/ERROR spam from probing unavailable camera indices
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -18,21 +19,75 @@ import streamlit as st
 
 TRACE_FILE   = Path("trace.jsonl")
 PATCHES_FILE = Path("patches.json")
+ARCHIVE_DIR  = Path("Archive")
 
 NPU_TARGET_MS   = 120.0   # AMD real-time robotics target; anything above this turns orange
 CPU_BASELINE_MS = 820.0   # measured baseline: same Moondream2 query on CPU-only
 
-SKILL_STEPS = [
-    {"step_id": 0, "action": "scan_shelf",      "label": "Scan Shelf"},
-    {"step_id": 1, "action": "pick_from_box",   "label": "Pick"},
-    {"step_id": 2, "action": "place_slot_1",    "label": "Place Slot 1"},
-    {"step_id": 3, "action": "place_slot_2",    "label": "Place Slot 2"},
-    {"step_id": 4, "action": "check_box_empty", "label": "Check Done"},
-]
+JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
-# Indices 1, 2 = external USB webcams (index 0 = laptop built-in, skipped).
-CAMERA_INDICES = [1, 2]
-CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
+
+@st.cache_data(ttl=60)
+def load_archive_stats() -> list[dict]:
+    rows = []
+    if not ARCHIVE_DIR.exists():
+        return rows
+    for skill_dir in sorted(ARCHIVE_DIR.iterdir()):
+        if skill_dir.name.startswith("_") or not skill_dir.is_dir():
+            continue
+        info_path = skill_dir / "meta" / "info.json"
+        stats_path = skill_dir / "meta" / "stats.json"
+        if not info_path.exists():
+            continue
+        try:
+            info  = json.loads(info_path.read_text())
+            stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
+        except Exception:
+            continue
+        name = skill_dir.name                       # e.g. "pick_object_v3"
+        parts = name.rsplit("_", 1)
+        family = "_".join(name.split("_")[:-1]) if parts[-1].startswith("v") and parts[-1][1:].isdigit() else name
+        version = parts[-1] if parts[-1].startswith("v") and parts[-1][1:].isdigit() else "v1"
+        episodes = info.get("total_episodes", 0)
+        frames   = info.get("total_frames",   0)
+        fps      = info.get("fps", 30)
+        duration_s = round(frames / fps) if fps else 0
+        gripper_range = ""
+        if stats.get("action"):
+            mn = stats["action"].get("min", [])
+            mx = stats["action"].get("max", [])
+            if len(mn) >= 6 and len(mx) >= 6:
+                gripper_range = f"{mn[5]:.1f}→{mx[5]:.1f}°"
+        rows.append({
+            "Skill":      family,
+            "Ver":        version,
+            "Episodes":   episodes,
+            "Frames":     frames,
+            "Duration":   f"{duration_s}s",
+            "Gripper":    gripper_range,
+        })
+    return rows
+
+
+def derive_skill_steps(events: list[dict]) -> list[dict]:
+    seen: dict[int, str] = {}
+    for e in events:
+        sid = e.get("step_id")
+        action = e.get("action", "")
+        if sid is not None and sid >= 0 and action:
+            seen.setdefault(sid, action)
+    if not seen:
+        return []
+    return [
+        {"step_id": sid, "action": act, "label": act.replace("_", " ").title()}
+        for sid, act in sorted(seen.items())
+    ]
+
+CAMERA_LABELS = ["Follower — Top", "Follower — Side"]
+
+def _get_slot_map() -> dict[int, int]:
+    # index 1 → slot 0 (Follower — Top), index 2 → slot 1 (Follower — Side); never touch 0 (laptop)
+    return {1: 0, 2: 1}
 
 RESULT_COLOR = {
     "PASS":           "#00D4AA",
@@ -88,10 +143,6 @@ class _CameraServer:
                 self.end_headers()
                 while srv._streaming_enabled:
                     data = srv._next_jpeg(idx)
-                    if data is None:
-                        # Should not happen now, but handle gracefully
-                        time.sleep(0.01)
-                        continue
                     try:
                         self.wfile.write(
                             b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
@@ -99,6 +150,7 @@ class _CameraServer:
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         break
+                    time.sleep(0.033)  # cap at ~30fps; also prevents flooding during blank-frame phase
 
         httpd = ThreadingHTTPServer(("127.0.0.1", MJPEG_PORT), _Handler)
         # allow fast restart without "address already in use" on page refresh
@@ -107,36 +159,41 @@ class _CameraServer:
 
     # ── camera lifecycle ───────────────────────────────────────────────────────
     def open(self) -> None:
-        # DirectShow init blocks 1-4s — background thread so UI renders immediately
         with self._lock:
             self._streaming_enabled = True
             self._health_check_stop = False
         threading.Thread(target=self._open_sync, daemon=True).start()
-        # restart health check (may have been stopped by a prior close())
         t = threading.Thread(target=self._health_check_loop, daemon=True)
         self._health_check_thread = t
         t.start()
 
     def _open_one(self, idx: int) -> cv2.VideoCapture | None:
-        # DirectShow requires sequential device init on Windows — do NOT call from parallel threads
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not cap.isOpened():
+        # try DSHOW (most reliable on Windows for USB webcams); never call while holding self._lock
+        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+            cap = cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ret, _ = cap.read()  # verify frames actually flow before returning
+            if ret:
+                return cap
             cap.release()
-            return None
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap
+        return None
 
     def _open_sync(self) -> None:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len(CAMERA_INDICES)) as ex:
-            new_handles = list(ex.map(self._open_one, CAMERA_INDICES))
+        slot_map = _get_slot_map()  # {opencv_idx: slot} keyed by physical USB port identity
+        new_handles: list[cv2.VideoCapture | None] = [None, None]
+        for dev_idx, slot in slot_map.items():
+            cap = self._open_one(dev_idx)
+            if cap:
+                new_handles[slot] = cap
         with self._lock:
-            # Guard: if close() fired while we were initialising, discard and don't overwrite
-            if not self._streaming_enabled:
+            if not self._streaming_enabled:  # close() fired while we were opening
                 for cap in new_handles:
                     if cap:
                         cap.release()
@@ -156,49 +213,60 @@ class _CameraServer:
             self._handles = []
 
     def _health_check_loop(self) -> None:
-        # Reconnects any camera slot that dropped to None while streaming is active
+        # re-queries USB port mapping every 0.5s to detect hot-plug into correct slot
         while not self._health_check_stop:
-            time.sleep(1.0)
+            time.sleep(0.5)
             if not self._streaming_enabled or self._health_check_stop:
                 continue
             with self._lock:
-                # use enumerate so slot position matches _handles list index
-                for slot, (dev_idx, cap) in enumerate(zip(CAMERA_INDICES, self._handles)):
-                    if cap is None:
-                        new_cap = self._open_one(dev_idx)
-                        if new_cap:
-                            self._handles[slot] = new_cap
+                empty_slots = {i for i, c in enumerate(self._handles) if c is None}
+            if not empty_slots:
+                continue
+            slot_map = _get_slot_map()
+            for dev_idx, slot in slot_map.items():
+                if slot not in empty_slots or not self._streaming_enabled:
+                    continue
+                new_cap = self._open_one(dev_idx)
+                with self._lock:
+                    if (self._streaming_enabled
+                            and slot < len(self._handles)
+                            and self._handles[slot] is None):
+                        self._handles[slot] = new_cap
+                    elif new_cap:
+                        new_cap.release()
 
     def _start_health_check(self) -> None:
         self._health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         self._health_check_thread.start()
 
     # ── frame production ───────────────────────────────────────────────────────
-    def _next_jpeg(self, idx: int) -> bytes:
-        # Hold lock for the entire read so close() cannot release the cap mid-read
+    def _next_jpeg(self, slot: int) -> bytes:
+        # hold lock for full read so close() cannot release the cap mid-read
         with self._lock:
-            if not self._streaming_enabled or idx >= len(self._handles):
-                return self._blank_frame()
-            cap = self._handles[idx]
+            if not self._streaming_enabled or slot >= len(self._handles):
+                return self._placeholder()
+            cap = self._handles[slot]
             if cap is None:
-                return self._blank_frame()
+                return self._placeholder()
             ret, frame_bgr = cap.read()
             if not ret:
                 cap.release()
-                self._handles[idx] = None
-                return self._blank_frame()
+                self._handles[slot] = None
+                return self._placeholder()
         frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
         _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
         return buf.tobytes()
 
-    def _blank_frame(self, width: int = 480, height: int = 360) -> bytes:
-        """Generate a black placeholder frame (cached for speed)."""
-        # Create once and reuse
-        if not hasattr(self, '_blank_cache'):
-            blank = np.zeros((height, width, 3), dtype=np.uint8)
-            _, buf = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 50])
-            self._blank_cache = buf.tobytes()
-        return self._blank_cache
+    def _placeholder(self) -> bytes:
+        if not hasattr(self, "_placeholder_cache"):
+            img = np.full((360, 480, 3), 28, dtype=np.uint8)
+            text, font, scale, thick = "Not connected", cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+            cv2.putText(img, text, ((480 - tw) // 2, (360 + th) // 2),
+                        font, scale, (80, 80, 80), thick, cv2.LINE_AA)
+            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            self._placeholder_cache = buf.tobytes()
+        return self._placeholder_cache
 
 
 @st.cache_resource
@@ -253,30 +321,71 @@ def get_active_react_phases(events: list[dict]) -> set[str]:
 st.set_page_config(page_title="SkillPatch", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+    html, body, [class*="css"] {
+        font-family: 'Space Grotesk', sans-serif !important;
+    }
+    code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
+
     .stDeployButton { display: none !important; }
     #MainMenu       { display: none !important; }
     footer          { display: none !important; }
     header[data-testid="stHeader"] { display: none !important; }
-    .block-container { padding-top: 1.2rem !important; }
+    .block-container {
+        padding-top: 0.6rem !important;
+        padding-bottom: 0.5rem !important;
+        max-width: 100% !important;
+    }
+    /* tighten all st.markdown vertical rhythm */
+    .element-container { margin-bottom: 0 !important; }
+    /* reduce plotly chart top whitespace */
+    .js-plotly-plot { margin-top: -6px !important; }
 
+    /* ── cards ── */
     .step-card {
         background: #161B27; border: 1px solid #2D3748;
-        border-radius: 8px; padding: 10px 8px;
-        text-align: center; font-size: 0.78rem; line-height: 1.4;
+        border-radius: 8px; padding: 8px 6px;
+        text-align: center; font-size: 0.76rem; line-height: 1.3;
+        transition: border-color 0.25s, box-shadow 0.25s;
     }
-    .step-card.active { border-color: #ED1C24; box-shadow: 0 0 8px #ED1C2466; }
+    .step-card.active {
+        border-color: #ED1C24; box-shadow: 0 0 10px #ED1C2455;
+        animation: pulse-border 1.4s ease-in-out infinite;
+    }
 
     .react-card {
         background: #161B27; border: 1px solid #2D3748;
-        border-radius: 8px; padding: 8px 6px; text-align: center; font-size: 0.75rem;
+        border-radius: 8px; padding: 7px 5px; text-align: center; font-size: 0.73rem;
+        transition: border-color 0.25s, background 0.25s;
     }
-    .react-card.active { border-color: #ED1C24; background: #1f0f12; box-shadow: 0 0 6px #ED1C2444; }
+    .react-card.active {
+        border-color: #ED1C24; background: #1f0f12;
+        box-shadow: 0 0 8px #ED1C2444;
+        animation: pulse-border 1.4s ease-in-out infinite;
+    }
 
     .metric-card {
         background: #161B27; border: 1px solid #2D3748;
-        border-radius: 8px; padding: 14px 16px;
+        border-radius: 8px; padding: 10px 14px;
     }
+
+    /* ── pulsing border animation for active cards ── */
+    @keyframes pulse-border {
+        0%, 100% { box-shadow: 0 0 6px #ED1C2433; }
+        50%       { box-shadow: 0 0 14px #ED1C24AA; }
+    }
+
+    /* ── compact streamlit metric widget ── */
+    [data-testid="stMetric"] { padding: 6px 0 !important; }
+    [data-testid="stMetricLabel"]  { font-size: 0.72rem !important; color: #8892A4 !important; }
+    [data-testid="stMetricValue"]  { font-size: 1.05rem !important; font-weight: 700 !important; }
+
+    /* ── dataframe compact ── */
+    [data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+    .dvn-scroller { max-height: 200px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -284,10 +393,10 @@ st.markdown("""
 col_title, col_badge = st.columns([3, 1])
 with col_title:
     st.markdown("""
-<h1 style='margin:0; font-size:2.2rem; letter-spacing:-0.5px;'>
+<h1 style='margin:0; font-size:1.9rem; letter-spacing:-0.5px; font-family: Space Grotesk, sans-serif;'>
     <span style='color:#ED1C24;'>Skill</span>Patch
 </h1>
-<p style='color:#8892A4; margin:2px 0 0 0; font-size:0.95rem;'>
+<p style='color:#8892A4; margin:1px 0 0 0; font-size:0.85rem;'>
     Self-Healing Robot Execution Layer
 </p>""", unsafe_allow_html=True)
 with col_badge:
@@ -300,7 +409,7 @@ with col_badge:
     <span style='color:#8892A4; font-size:0.72rem;'>Phi-3-mini · LeRobot SO-100</span>
 </div>""", unsafe_allow_html=True)
 
-st.markdown("<hr style='border-color:#2D3748; margin:0.5rem 0;'>", unsafe_allow_html=True)
+st.markdown("<hr style='border-color:#2D3748; margin:0.2rem 0;'>", unsafe_allow_html=True)
 
 
 # polls trace.jsonl + patches.json every 500ms and redraws only this fragment, not the full page
@@ -355,7 +464,7 @@ def live_dashboard() -> None:
     <div style='color:#8892A4; font-size:0.68rem; margin-top:2px;'>{phase["desc"]}</div>
 </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
     # ── execution pipeline ────────────────────────────────────────────────────
     st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:0 0 4px 0;'>EXECUTION PIPELINE</p>",
@@ -368,8 +477,13 @@ def live_dashboard() -> None:
             latest_by_step[sid] = e
     current_step = events[-1].get("step_id", -1) if events else -1
 
-    step_cols = st.columns(len(SKILL_STEPS))
-    for i, step in enumerate(SKILL_STEPS):
+    skill_steps = derive_skill_steps(events)
+    if not skill_steps:
+        st.markdown("<div style='color:#4A5568; font-size:0.85rem; padding:8px 0;'>No steps yet.</div>",
+                    unsafe_allow_html=True)
+        skill_steps = []
+    step_cols = st.columns(max(len(skill_steps), 1))
+    for i, step in enumerate(skill_steps):
         sid = step["step_id"]
         ev  = latest_by_step.get(sid)
         if ev is None:
@@ -389,7 +503,7 @@ def live_dashboard() -> None:
     <div style='color:{color}; font-size:0.7rem;'>{status}</div>
 </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
     # ── metrics row ───────────────────────────────────────────────────────────
     col_a, col_b, col_c, col_d = st.columns(4)
@@ -460,7 +574,7 @@ def live_dashboard() -> None:
     </div>
 </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
 
     # ── NPU latency charts ────────────────────────────────────────────────────
     latency_events = [e for e in events if e.get("npu_latency_ms") is not None]
@@ -484,9 +598,9 @@ def live_dashboard() -> None:
             xaxis=dict(range=[0, CPU_BASELINE_MS * 1.1], color="#8892A4",
                        showgrid=True, gridcolor="#2D3748"),
             yaxis=dict(color="#F0F2F6"),
-            height=160, margin=dict(l=0, r=10, t=28, b=0),
+            height=140, margin=dict(l=0, r=10, t=28, b=0),
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
 
     with col_trend:
         if len(latency_events) > 1:
@@ -505,18 +619,18 @@ def live_dashboard() -> None:
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 xaxis=dict(color="#8892A4", showgrid=False),
                 yaxis=dict(color="#8892A4", showgrid=True, gridcolor="#2D3748"),
-                height=160, margin=dict(l=0, r=0, t=28, b=0), showlegend=False,
+                height=140, margin=dict(l=0, r=0, t=28, b=0), showlegend=False,
             )
-            st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(fig2, width='stretch', config={"displayModeBar": False})
         else:
             st.markdown(
-                "<div style='color:#4A5568; font-size:0.85rem; padding:55px 0; text-align:center;'>"
+                "<div style='color:#4A5568; font-size:0.85rem; padding:20px 0; text-align:center;'>"
                 "Trend appears after first inference</div>", unsafe_allow_html=True)
 
-    st.markdown("<hr style='border-color:#2D3748; margin:0.4rem 0;'>", unsafe_allow_html=True)
+    st.markdown("<hr style='border-color:#2D3748; margin:0.2rem 0;'>", unsafe_allow_html=True)
 
     # ── execution trace ───────────────────────────────────────────────────────
-    st.markdown("#### Execution Traces")
+    st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:0 0 3px 0;'>EXECUTION TRACES</p>", unsafe_allow_html=True)
     skill_events = [e for e in events if e.get("type") != "SIMULATION_COMPLETE"]
     if not skill_events:
         st.markdown("<div style='color:#4A5568; padding:16px 0;'>No events yet — "
@@ -541,16 +655,12 @@ def live_dashboard() -> None:
                     "FAIL": "color: #FF4444", "ABORT": "color: #FF0000"}.get(val, "")
 
         st.dataframe(pd.DataFrame(rows).style.map(_color, subset=["Result"]),
-                     use_container_width=True, hide_index=True, height=250)
+                     use_container_width=True, hide_index=True, height=190)
 
-    st.markdown("<hr style='border-color:#2D3748; margin:0.4rem 0;'>", unsafe_allow_html=True)
+    st.markdown("<hr style='border-color:#2D3748; margin:0.2rem 0;'>", unsafe_allow_html=True)
 
     # ── patch memory ──────────────────────────────────────────────────────────
-    st.markdown("#### Patch Memory")
-    st.markdown("<p style='color:#8892A4; font-size:0.82rem; margin-top:-6px;'>"
-                "Every row is a failure the system has diagnosed and aims to not repeat the same failure cause again — "
-                "the data flywheel that makes each deployment more reliable over time.</p>",
-                unsafe_allow_html=True)
+    st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:0 0 3px 0;'>PATCH MEMORY</p>", unsafe_allow_html=True)
     if not patches:
         st.markdown("<div style='color:#4A5568; padding:10px 0;'>No patches yet. "
                     "The first failure will populate this table.</div>", unsafe_allow_html=True)
@@ -567,6 +677,23 @@ def live_dashboard() -> None:
                 "Last Applied":    val.get("last_applied", "—"),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("<hr style='border-color:#2D3748; margin:0.2rem 0;'>", unsafe_allow_html=True)
+
+    # ── training archive ──────────────────────────────────────────────────────
+    st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:0 0 3px 0;'>TRAINING ARCHIVE</p>", unsafe_allow_html=True)
+    archive_rows = load_archive_stats()
+    if not archive_rows:
+        st.markdown("<div style='color:#4A5568; padding:10px 0;'>Archive/ not found.</div>",
+                    unsafe_allow_html=True)
+    else:
+        total_eps    = sum(r["Episodes"] for r in archive_rows)
+        total_frames = sum(r["Frames"]   for r in archive_rows)
+        col_e, col_f, col_s = st.columns(3)
+        col_e.metric("Total Episodes",  total_eps)
+        col_f.metric("Total Frames",    f"{total_frames:,}")
+        col_s.metric("Skills Recorded", len({r["Skill"] for r in archive_rows}))
+        st.dataframe(pd.DataFrame(archive_rows), use_container_width=True, hide_index=True, height=175)
 
 
 # st.fragment(run_every=0.5) re-executes only this function on a timer without re-running the full page

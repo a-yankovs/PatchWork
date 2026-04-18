@@ -88,8 +88,14 @@ QUERIES: dict[str, str] = {
 
 def _ask(frame, question: str) -> tuple[bool, float]:
     """
-    Encode frame as JPEG, POST to Ollama, return (bool, latency_ms).
-    Raises requests.RequestException on connection failure.
+    [REAL] Encode frame as JPEG, POST to Ollama, return (bool, latency_ms).
+
+    Requires Ollama running locally with moondream-verify loaded:
+        ollama pull moondream
+        ollama serve               # or: systemctl start ollama
+        # Confirm ROCm offload: ollama run moondream (should show 25/25 GPU layers)
+
+    Raises requests.RequestException on connection failure (caller catches this).
     """
     _, buf = cv2.imencode(".jpg", frame)
     img_b64 = base64.b64encode(buf).decode()
@@ -136,9 +142,13 @@ def verify(frame, query: str) -> tuple[bool, float]:
     """
     question = QUERIES.get(query, query)   # key → canned question, else use query as-is
     try:
-        return _ask(frame, question)
+        return _ask(frame, question)   # [REAL] live Moondream2 inference
     except Exception as exc:
-        logger.error("vlm_api.verify failed: %s", exc)
+        # [MOCK-LIKE FALLBACK] Connection to Ollama failed or model not loaded.
+        # Returns (False, 0.0) so the orchestrator treats this step as failed
+        # and runs the classifier → patch → retry path rather than crashing.
+        # Fix: ensure Ollama is running and moondream-verify is loaded.
+        logger.error("vlm_api.verify failed (is Ollama running?): %s", exc)
         return False, 0.0
 
 
