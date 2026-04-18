@@ -58,12 +58,13 @@ class _CameraServer:
     """MJPEG server — streams camera frames directly to the browser, bypassing Streamlit."""
 
     def __init__(self) -> None:
-        self._lock       = threading.Lock()
-        self._handles:    list[cv2.VideoCapture | None] = []
-        self._prev_grays: list[np.ndarray | None]       = []
-        self._bg_subs:    list                          = []
-        self._flow_on    = False
+        self._lock              = threading.Lock()
+        self._handles: list[cv2.VideoCapture | None] = []
+        self._streaming_enabled = False
+        self._health_check_thread = None
+        self._health_check_stop = False
         self._start_http()
+        self._start_health_check()
 
     # ── HTTP server ────────────────────────────────────────────────────────────
     def _start_http(self) -> None:
@@ -74,19 +75,21 @@ class _CameraServer:
                 pass
 
             def do_GET(self) -> None:
-                if not (self.path.startswith("/cam") and self.path[4:].isdigit()):
+                path = self.path.split("?")[0]
+                if not (path.startswith("/cam") and path[4:].isdigit()):
                     self.send_response(404)
                     self.end_headers()
                     return
-                idx = int(self.path[4:])
+                idx = int(path[4:])
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                while True:
+                while srv._streaming_enabled:
                     data = srv._next_jpeg(idx)
                     if data is None:
-                        time.sleep(0.033)
+                        # Should not happen now, but handle gracefully
+                        time.sleep(0.01)
                         continue
                     try:
                         self.wfile.write(
@@ -103,158 +106,113 @@ class _CameraServer:
 
     # ── camera lifecycle ───────────────────────────────────────────────────────
     def open(self) -> None:
+        # VideoCapture init blocks 1-4s on Windows/DirectShow — fire to a
+        # background thread so the <img> tag renders immediately and frames
+        # stream in as soon as the camera is ready.
+        with self._lock:
+            self._streaming_enabled = True
+            self._health_check_stop = False
+        threading.Thread(target=self._open_sync, daemon=True).start()
+
+    def _open_sync(self) -> None:
+        new_handles = []
+        for idx in CAMERA_INDICES:
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                new_handles.append(cap)
+            else:
+                cap.release()
+                new_handles.append(None)
         with self._lock:
             for cap in self._handles:
                 if cap:
                     cap.release()
-            handles, prev_grays, bg_subs = [], [], []
-            for idx in CAMERA_INDICES:
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if cap.isOpened():
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-                    cap.set(cv2.CAP_PROP_FPS, 30)
-                    bg = cv2.createBackgroundSubtractorMOG2(
-                        history=50, varThreshold=30, detectShadows=False
-                    )
-                    # pre-seed background with first still frame so arm detection is instant
-                    ret, frame = cap.read()
-                    if ret:
-                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        for _ in range(50):
-                            bg.apply(gray)
-                    handles.append(cap)
-                    bg_subs.append(bg)
-                else:
-                    cap.release()
-                    handles.append(None)
-                    bg_subs.append(None)
-                prev_grays.append(None)
-            self._handles    = handles
-            self._prev_grays = prev_grays
-            self._bg_subs    = bg_subs
+            self._handles = new_handles
 
     def close(self) -> None:
         with self._lock:
+            self._streaming_enabled = False
+            self._health_check_stop = True
             for cap in self._handles:
                 if cap:
                     cap.release()
-            self._handles, self._prev_grays, self._bg_subs = [], [], []
+            self._handles = []
 
-    def set_flow(self, on: bool) -> None:
-        self._flow_on = on
+    def _start_health_check(self) -> None:
+        """Start background thread that monitors and reconnects cameras."""
+        def health_check_loop() -> None:
+            while not self._health_check_stop:
+                time.sleep(1.0)  # Check every 1 second
+                
+                if not self._streaming_enabled or self._health_check_stop:
+                    continue
+                
+                with self._lock:
+                    # Try to re-open any cameras marked as None
+                    for idx in CAMERA_INDICES:
+                        if idx >= len(self._handles):
+                            continue
+                        if self._handles[idx] is None:
+                            # Try to reconnect
+                            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                            if cap.isOpened():
+                                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+                                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                                cap.set(cv2.CAP_PROP_FPS, 30)
+                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                                self._handles[idx] = cap
+                            else:
+                                cap.release()
+        
+        self._health_check_thread = threading.Thread(target=health_check_loop, daemon=True)
+        self._health_check_thread.start()
 
     # ── frame production ───────────────────────────────────────────────────────
     def _next_jpeg(self, idx: int) -> bytes | None:
         with self._lock:
-            if idx >= len(self._handles):
-                return None
-            cap  = self._handles[idx]
-            bg   = self._bg_subs[idx]    if idx < len(self._bg_subs)    else None
-            prev = self._prev_grays[idx] if idx < len(self._prev_grays) else None
-        if cap is None or not cap.isOpened():
-            return None
+            if not self._streaming_enabled or idx >= len(self._handles):
+                return self._blank_frame()
+            cap = self._handles[idx]
+            if cap is None:
+                # Camera was never available
+                return self._blank_frame()
+        
+        # Read outside the lock for speed
         ret, frame_bgr = cap.read()
-        if not ret:
-            return None
-        if self._flow_on and bg is not None:
-            frame_rgb           = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame_rgb, new_prev = _overlay_flow(frame_rgb, prev, bg)
+        
+        # If read fails (camera unplugged), mark as unavailable
+        if not ret or not cap.isOpened():
             with self._lock:
-                if idx < len(self._prev_grays):
-                    self._prev_grays[idx] = new_prev
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if idx < len(self._handles) and self._handles[idx] is cap:
+                    cap.release()
+                    self._handles[idx] = None
+            return self._blank_frame()
+        
+        # Resize and encode as fast as possible
+        frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
+        # Use fast JPEG encoding (quality 75 for speed, still good quality)
+        _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
         return buf.tobytes()
+
+    def _blank_frame(self, width: int = 480, height: int = 360) -> bytes:
+        """Generate a black placeholder frame (cached for speed)."""
+        # Create once and reuse
+        if not hasattr(self, '_blank_cache'):
+            blank = np.zeros((height, width, 3), dtype=np.uint8)
+            _, buf = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            self._blank_cache = buf.tobytes()
+        return self._blank_cache
 
 
 @st.cache_resource
 def _camera_server() -> _CameraServer:
     return _CameraServer()
-
-
-# MediaPipe selfie segmentation — used to EXCLUDE human pixels from flow
-# Falls back gracefully if mediapipe isn't installed
-try:
-    import mediapipe as mp
-    _mp_selfie = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=0)
-except Exception:
-    _mp_selfie = None
-
-
-def _person_mask(frame_rgb: np.ndarray) -> np.ndarray:
-    """Returns 255 where a person is detected (pixels to exclude from arm flow)."""
-    if _mp_selfie is None:
-        return np.zeros(frame_rgb.shape[:2], dtype=np.uint8)
-    result = _mp_selfie.process(frame_rgb)
-    if result.segmentation_mask is None:
-        return np.zeros(frame_rgb.shape[:2], dtype=np.uint8)
-    return (result.segmentation_mask > 0.5).astype(np.uint8) * 255
-
-
-# SO-ARM100 color profile in HSV — white/cream plastic body + black servo joints
-_ARM_RANGES = [
-    (np.array([0,   0, 170]), np.array([180, 55, 255])),  # white / off-white body
-    (np.array([0,   0,   0]), np.array([180, 70,  70])),  # black servo joints
-]
-
-
-def _arm_color_mask(frame_rgb: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
-    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    for lo, hi in _ARM_RANGES:
-        mask |= cv2.inRange(hsv, lo, hi)
-    # dilate so objects held inside the gripper are included
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    return cv2.dilate(mask, kernel, iterations=2)
-
-
-def _overlay_flow(
-    frame_rgb: np.ndarray,
-    prev_gray: np.ndarray | None,
-    bg_sub: cv2.BackgroundSubtractorMOG2,
-) -> tuple[np.ndarray, np.ndarray]:
-    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-    out  = frame_rgb.copy()
-
-    # motion mask: MOG2 detects what's moving
-    fg_raw  = bg_sub.apply(gray)
-    kernel5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    fg_mask = cv2.morphologyEx(fg_raw, cv2.MORPH_OPEN, kernel5)
-
-    # color mask: only SO-ARM100 colors (white body + black joints)
-    arm_mask = _arm_color_mask(frame_rgb)
-
-    # person mask: exclude any pixels MediaPipe identifies as human
-    not_person = cv2.bitwise_not(_person_mask(frame_rgb))
-
-    # combined: moving + arm-colored + not a person
-    combined = cv2.bitwise_and(cv2.bitwise_and(fg_mask, arm_mask), not_person)
-
-    if prev_gray is not None and prev_gray.shape == gray.shape:
-        half_prev = cv2.resize(prev_gray, (0, 0), fx=0.5, fy=0.5)
-        half_curr = cv2.resize(gray,      (0, 0), fx=0.5, fy=0.5)
-        flow = cv2.calcOpticalFlowFarneback(
-            half_prev, half_curr, None,
-            pyr_scale=0.5, levels=2, winsize=12,
-            iterations=2, poly_n=5, poly_sigma=1.1, flags=0,
-        )
-        step = 10
-        h_half, w_half = half_curr.shape
-        for y in range(step, h_half - step, step):
-            for x in range(step, w_half - step, step):
-                x0, y0 = x * 2, y * 2
-                if combined[y0, x0] == 0:
-                    continue
-                fx, fy = flow[y, x]
-                mag = fx * fx + fy * fy
-                if mag > 2.25:
-                    x1, y1    = int(x0 + fx * 5), int(y0 + fy * 5)
-                    thickness = 2 if mag > 9.0 else 1
-                    cv2.line(out, (x0, y0), (x1, y1), (0, 212, 170), thickness)
-
-    return out, gray
 
 
 def load_trace() -> list[dict]:
@@ -339,7 +297,7 @@ with col_title:
     <span style='color:#ED1C24;'>Skill</span>Patch
 </h1>
 <p style='color:#8892A4; margin:2px 0 0 0; font-size:0.95rem;'>
-    Self-Healing Robot Execution Layer &nbsp;·&nbsp; On-device · No cloud · No engineer
+    Self-Healing Robot Execution Layer
 </p>""", unsafe_allow_html=True)
 with col_badge:
     st.markdown("""
@@ -348,7 +306,7 @@ with col_badge:
                  border-radius:4px; font-size:0.75rem; font-weight:600;'>
         AMD Ryzen AI NPU
     </span><br/>
-    <span style='color:#8892A4; font-size:0.72rem;'>Moondream2 INT4 · Phi-3-mini · LeRobot SO-100</span>
+    <span style='color:#8892A4; font-size:0.72rem;'>Phi-3-mini · LeRobot SO-100</span>
 </div>""", unsafe_allow_html=True)
 
 st.markdown("<hr style='border-color:#2D3748; margin:0.5rem 0;'>", unsafe_allow_html=True)
@@ -576,7 +534,7 @@ def live_dashboard() -> None:
         rows = []
         for e in reversed(skill_events[-60:]):
             rows.append({
-                "Time":    datetime.fromtimestamp(e.get("timestamp", 0)).strftime("%H:%M:%S"),
+                "Timestamp": datetime.fromtimestamp(e.get("timestamp", 0)).strftime("%H:%M:%S"),
                 "Step":    e.get("step_id", "—"),
                 "Action":  e.get("action", "—"),
                 "Result":  e.get("result", "—"),
@@ -622,32 +580,30 @@ def live_dashboard() -> None:
 def camera_feeds() -> None:
     srv = _camera_server()
 
-    cam_header, col_flow, cam_toggle = st.columns([4, 1, 1])
+    cam_header, cam_toggle = st.columns([5, 1])
     with cam_header:
         st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:6px 0 4px 0;'>LIVE CAMERA FEEDS</p>",
                     unsafe_allow_html=True)
     with cam_toggle:
         cameras_on = st.toggle("Enable Camera", key="cameras_enabled", value=False)
-    with col_flow:
-        flow_on = st.toggle("Motion", key="flow_enabled", value=False, disabled=not cameras_on)
-    if not cameras_on:
-        flow_on = False
 
-    # open/close cameras only on toggle transitions
+    # open/close only on toggle edge; cache-bust token forces browser to make a
+    # fresh HTTP request on re-enable (same URL would reuse the dead connection)
     was_on = st.session_state.get("_cam_was_on", False)
     if cameras_on and not was_on:
         srv.open()
+        st.session_state["_cam_token"] = int(time.time())
     elif not cameras_on and was_on:
         srv.close()
     st.session_state["_cam_was_on"] = cameras_on
-    srv.set_flow(flow_on)
 
     if cameras_on:
+        token = st.session_state.get("_cam_token", 0)
         cam_cols = st.columns(2)
         for i, label in enumerate(CAMERA_LABELS):
             with cam_cols[i]:
                 st.markdown(
-                    f"<img src='http://localhost:{MJPEG_PORT}/cam{i}' "
+                    f"<img src='http://localhost:{MJPEG_PORT}/cam{i}?t={token}' "
                     f"style='width:100%;border-radius:8px;display:block;' alt='{label}'>"
                     f"<p style='color:#8892A4;font-size:0.75rem;text-align:center;margin:4px 0 0;'>"
                     f"{label}</p>",

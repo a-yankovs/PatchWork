@@ -2,11 +2,11 @@
   "stock_middle_shelf:GRASP_FAIL": {
     "z_offset_mm": 5,
     "applied_count": 1,
-    "last_applied": "2026-04-17T23:52:10"
+    "last_applied": "2026-04-18T01:43:31"
   },
   "stock_middle_shelf:PLACEMENT_MISS": {
     "approach_angle_deg": 10,
     "applied_count": 1,
-    "last_applied": "2026-04-17T23:52:22"
+    "last_applied": "2026-04-18T01:43:43"
   }
 }
