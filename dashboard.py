@@ -3,9 +3,15 @@
 # the ReAct agentic loop phase, NPU vs CPU latency, execution history, and patch memory.
 
 import json
+import socket
+import threading
+import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -24,6 +30,10 @@ SKILL_STEPS = [
     {"step_id": 4, "action": "check_box_empty", "label": "Check Done"},
 ]
 
+# Index 0 = laptop built-in (testing). Swap to [1, 2] when AMD USB cams are connected.
+CAMERA_INDICES = [0, 1]
+CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
+
 RESULT_COLOR = {
     "PASS":    "#00D4AA",
     "PATCHED": "#FF8C00",
@@ -39,6 +49,212 @@ REACT_PHASES = [
     {"key": "REFLECT", "label": "Reflect", "desc": "Classifier diagnoses failure"},
     {"key": "PATCH",   "label": "Patch",   "desc": "Orchestrator applies fix + retries"},
 ]
+
+
+MJPEG_PORT = 8765
+
+
+class _CameraServer:
+    """MJPEG server — streams camera frames directly to the browser, bypassing Streamlit."""
+
+    def __init__(self) -> None:
+        self._lock       = threading.Lock()
+        self._handles:    list[cv2.VideoCapture | None] = []
+        self._prev_grays: list[np.ndarray | None]       = []
+        self._bg_subs:    list                          = []
+        self._flow_on    = False
+        self._start_http()
+
+    # ── HTTP server ────────────────────────────────────────────────────────────
+    def _start_http(self) -> None:
+        srv = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                if not (self.path.startswith("/cam") and self.path[4:].isdigit()):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                idx = int(self.path[4:])
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                while True:
+                    data = srv._next_jpeg(idx)
+                    if data is None:
+                        time.sleep(0.033)
+                        continue
+                    try:
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
+                        )
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", MJPEG_PORT), _Handler)
+        # allow fast restart without "address already in use" on page refresh
+        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    # ── camera lifecycle ───────────────────────────────────────────────────────
+    def open(self) -> None:
+        with self._lock:
+            for cap in self._handles:
+                if cap:
+                    cap.release()
+            handles, prev_grays, bg_subs = [], [], []
+            for idx in CAMERA_INDICES:
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                    bg = cv2.createBackgroundSubtractorMOG2(
+                        history=50, varThreshold=30, detectShadows=False
+                    )
+                    # pre-seed background with first still frame so arm detection is instant
+                    ret, frame = cap.read()
+                    if ret:
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        for _ in range(50):
+                            bg.apply(gray)
+                    handles.append(cap)
+                    bg_subs.append(bg)
+                else:
+                    cap.release()
+                    handles.append(None)
+                    bg_subs.append(None)
+                prev_grays.append(None)
+            self._handles    = handles
+            self._prev_grays = prev_grays
+            self._bg_subs    = bg_subs
+
+    def close(self) -> None:
+        with self._lock:
+            for cap in self._handles:
+                if cap:
+                    cap.release()
+            self._handles, self._prev_grays, self._bg_subs = [], [], []
+
+    def set_flow(self, on: bool) -> None:
+        self._flow_on = on
+
+    # ── frame production ───────────────────────────────────────────────────────
+    def _next_jpeg(self, idx: int) -> bytes | None:
+        with self._lock:
+            if idx >= len(self._handles):
+                return None
+            cap  = self._handles[idx]
+            bg   = self._bg_subs[idx]    if idx < len(self._bg_subs)    else None
+            prev = self._prev_grays[idx] if idx < len(self._prev_grays) else None
+        if cap is None or not cap.isOpened():
+            return None
+        ret, frame_bgr = cap.read()
+        if not ret:
+            return None
+        if self._flow_on and bg is not None:
+            frame_rgb           = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb, new_prev = _overlay_flow(frame_rgb, prev, bg)
+            with self._lock:
+                if idx < len(self._prev_grays):
+                    self._prev_grays[idx] = new_prev
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        return buf.tobytes()
+
+
+@st.cache_resource
+def _camera_server() -> _CameraServer:
+    return _CameraServer()
+
+
+# MediaPipe selfie segmentation — used to EXCLUDE human pixels from flow
+# Falls back gracefully if mediapipe isn't installed
+try:
+    import mediapipe as mp
+    _mp_selfie = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=0)
+except Exception:
+    _mp_selfie = None
+
+
+def _person_mask(frame_rgb: np.ndarray) -> np.ndarray:
+    """Returns 255 where a person is detected (pixels to exclude from arm flow)."""
+    if _mp_selfie is None:
+        return np.zeros(frame_rgb.shape[:2], dtype=np.uint8)
+    result = _mp_selfie.process(frame_rgb)
+    if result.segmentation_mask is None:
+        return np.zeros(frame_rgb.shape[:2], dtype=np.uint8)
+    return (result.segmentation_mask > 0.5).astype(np.uint8) * 255
+
+
+# SO-ARM100 color profile in HSV — white/cream plastic body + black servo joints
+_ARM_RANGES = [
+    (np.array([0,   0, 170]), np.array([180, 55, 255])),  # white / off-white body
+    (np.array([0,   0,   0]), np.array([180, 70,  70])),  # black servo joints
+]
+
+
+def _arm_color_mask(frame_rgb: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lo, hi in _ARM_RANGES:
+        mask |= cv2.inRange(hsv, lo, hi)
+    # dilate so objects held inside the gripper are included
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    return cv2.dilate(mask, kernel, iterations=2)
+
+
+def _overlay_flow(
+    frame_rgb: np.ndarray,
+    prev_gray: np.ndarray | None,
+    bg_sub: cv2.BackgroundSubtractorMOG2,
+) -> tuple[np.ndarray, np.ndarray]:
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    out  = frame_rgb.copy()
+
+    # motion mask: MOG2 detects what's moving
+    fg_raw  = bg_sub.apply(gray)
+    kernel5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_mask = cv2.morphologyEx(fg_raw, cv2.MORPH_OPEN, kernel5)
+
+    # color mask: only SO-ARM100 colors (white body + black joints)
+    arm_mask = _arm_color_mask(frame_rgb)
+
+    # person mask: exclude any pixels MediaPipe identifies as human
+    not_person = cv2.bitwise_not(_person_mask(frame_rgb))
+
+    # combined: moving + arm-colored + not a person
+    combined = cv2.bitwise_and(cv2.bitwise_and(fg_mask, arm_mask), not_person)
+
+    if prev_gray is not None and prev_gray.shape == gray.shape:
+        half_prev = cv2.resize(prev_gray, (0, 0), fx=0.5, fy=0.5)
+        half_curr = cv2.resize(gray,      (0, 0), fx=0.5, fy=0.5)
+        flow = cv2.calcOpticalFlowFarneback(
+            half_prev, half_curr, None,
+            pyr_scale=0.5, levels=2, winsize=12,
+            iterations=2, poly_n=5, poly_sigma=1.1, flags=0,
+        )
+        step = 10
+        h_half, w_half = half_curr.shape
+        for y in range(step, h_half - step, step):
+            for x in range(step, w_half - step, step):
+                x0, y0 = x * 2, y * 2
+                if combined[y0, x0] == 0:
+                    continue
+                fx, fy = flow[y, x]
+                mag = fx * fx + fy * fy
+                if mag > 2.25:
+                    x1, y1    = int(x0 + fx * 5), int(y0 + fy * 5)
+                    thickness = 2 if mag > 9.0 else 1
+                    cv2.line(out, (x0, y0), (x1, y1), (0, 212, 170), thickness)
+
+    return out, gray
 
 
 def load_trace() -> list[dict]:
@@ -144,9 +360,10 @@ def live_dashboard() -> None:
     patches = load_patches()
 
     # ── simulation complete banner ─────────────────────────────────────────────
-    # the simulator writes a SIMULATION_COMPLETE event as the final trace line when all runs finish
+    # only show if the SIMULATION_COMPLETE event was written after this page session started —
+    # prevents stale banner from appearing when the tab is refreshed between runs
     complete = next((e for e in events if e.get("type") == "SIMULATION_COMPLETE"), None)
-    if complete:
+    if complete and complete.get("timestamp", 0) > st.session_state.get("session_start", 0):
         runs      = complete.get("total_runs", "?")
         learned   = complete.get("patches_learned", len(patches))
         prevented = sum(1 for e in events if e.get("result") == "PASS" and e.get("patch_applied"))
@@ -307,17 +524,17 @@ def live_dashboard() -> None:
             y=["NPU (live)", "CPU only"],
             orientation="h",
             marker_color=[bar_color, "#4A5568"],
-            text=[f"{live_ms:.1f} ms", f"{CPU_BASELINE_MS:.0f} ms  (too slow for real-time)"],
-            textposition="outside",
-            textfont=dict(color="#F0F2F6"),
+            text=[f"{live_ms:.1f} ms", f"{CPU_BASELINE_MS:.0f} ms"],
+            textposition="inside",
+            textfont=dict(color="#FFFFFF", size=12),
         ))
         fig.update_layout(
-            title=dict(text="NPU vs CPU — real-time threshold is 120ms", font=dict(color="#8892A4", size=12)),
+            title=dict(text="NPU vs CPU — real-time threshold is 120 ms", font=dict(color="#8892A4", size=12)),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(range=[0, CPU_BASELINE_MS * 1.25], color="#8892A4",
+            xaxis=dict(range=[0, CPU_BASELINE_MS * 1.1], color="#8892A4",
                        showgrid=True, gridcolor="#2D3748"),
             yaxis=dict(color="#F0F2F6"),
-            height=160, margin=dict(l=0, r=80, t=28, b=0),
+            height=160, margin=dict(l=0, r=10, t=28, b=0),
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
@@ -401,4 +618,53 @@ def live_dashboard() -> None:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+@st.fragment(run_every=0.5)
+def camera_feeds() -> None:
+    srv = _camera_server()
+
+    cam_header, col_flow, cam_toggle = st.columns([4, 1, 1])
+    with cam_header:
+        st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:6px 0 4px 0;'>LIVE CAMERA FEEDS</p>",
+                    unsafe_allow_html=True)
+    with cam_toggle:
+        cameras_on = st.toggle("Enable Camera", key="cameras_enabled", value=False)
+    with col_flow:
+        flow_on = st.toggle("Motion", key="flow_enabled", value=False, disabled=not cameras_on)
+    if not cameras_on:
+        flow_on = False
+
+    # open/close cameras only on toggle transitions
+    was_on = st.session_state.get("_cam_was_on", False)
+    if cameras_on and not was_on:
+        srv.open()
+    elif not cameras_on and was_on:
+        srv.close()
+    st.session_state["_cam_was_on"] = cameras_on
+    srv.set_flow(flow_on)
+
+    if cameras_on:
+        cam_cols = st.columns(2)
+        for i, label in enumerate(CAMERA_LABELS):
+            with cam_cols[i]:
+                st.markdown(
+                    f"<img src='http://localhost:{MJPEG_PORT}/cam{i}' "
+                    f"style='width:100%;border-radius:8px;display:block;' alt='{label}'>"
+                    f"<p style='color:#8892A4;font-size:0.75rem;text-align:center;margin:4px 0 0;'>"
+                    f"{label}</p>",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.markdown(
+            "<div style='background:#161B27;border:1px dashed #2D3748;border-radius:8px;"
+            "padding:16px;text-align:center;color:#4A5568;font-size:0.8rem;'>"
+            "Toggle <b style='color:#8892A4;'>Enable Camera</b> above to activate AMD webcams"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+
+if "session_start" not in st.session_state:
+    st.session_state.session_start = datetime.now().timestamp()
+
+camera_feeds()
 live_dashboard()
