@@ -30,8 +30,8 @@ SKILL_STEPS = [
     {"step_id": 4, "action": "check_box_empty", "label": "Check Done"},
 ]
 
-# Index 0 = laptop built-in (testing). Swap to [1, 2] when AMD USB cams are connected.
-CAMERA_INDICES = [0, 1]
+# Indices 1, 2 = external USB webcams (index 0 = laptop built-in, skipped).
+CAMERA_INDICES = [1, 2]
 CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
 
 RESULT_COLOR = {
