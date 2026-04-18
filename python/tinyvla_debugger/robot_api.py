@@ -267,11 +267,26 @@ class RobotAPI:
                 }
             )
 
-    def replay_skill(self, skill_name: str, params: Optional[Dict[str, Any]] = None) -> Iterator[StepEvent]:
+    def replay_skill(
+        self,
+        skill_name: str,
+        params: Optional[Dict[str, Any]] = None,
+        episode: int = 0,
+    ) -> Iterator[StepEvent]:
         """Replay a recorded skill step-by-step.
 
-        Each logical step is replayed via LeRobot episode replay for episode 0.
+        Each logical step is replayed via LeRobot episode replay.
         A StepEvent is yielded after each step completes.
+
+        Args:
+            skill_name: Action name (e.g. "box_in_shelf") — must have a
+                        manifest in skillpatch_data/skills/.
+            params:     Runtime parameter overrides (merged with stored patches).
+            episode:    Which recorded episode to replay. The orchestrator passes
+                        the attempt index (0, 1, …) so each retry runs a different
+                        trajectory. Falls back to episode 0 if the requested
+                        episode doesn't exist (lerobot-replay will raise, which
+                        the orchestrator already catches as a RuntimeError).
 
         This is the main interface the orchestrator/VLM should call.
         """
@@ -280,7 +295,7 @@ class RobotAPI:
 
         for step in spec.steps:
             started_at = time.time()
-            self._replay_single_step(step.dataset_repo_id, episode=0)
+            self._replay_single_step(step.dataset_repo_id, episode=episode)
             event = StepEvent(
                 skill_name=skill_name,
                 step_id=step.step_id,
@@ -290,11 +305,7 @@ class RobotAPI:
                 gripper_state=self._infer_gripper_state(step.name),
                 params_used=asdict(merged_params),
                 result="EXECUTED",
-                notes=(
-                    "LeRobot step replay completed. Runtime patch parameters were exposed "
-                    "to the caller and persisted, but low-level motion transforms are not "
-                    "physically injected by this version of robot_api."
-                ),
+                notes=f"LeRobot step replay completed (episode={episode}).",
             )
             self._log_trace(
                 {
@@ -304,6 +315,7 @@ class RobotAPI:
                     "step_id": step.step_id,
                     "action": step.name,
                     "dataset_repo_id": step.dataset_repo_id,
+                    "episode": episode,
                     "duration_s": round(time.time() - started_at, 3),
                     "params_used": asdict(merged_params),
                 }

@@ -332,6 +332,10 @@ class Orchestrator:
                     None, self._capture_frame
                 )
                 pre_ok, pre_latency = self._vlm.verify(pre_frame, pre_query)
+                self._save_debug_frame(
+                    pre_frame, step_id=step_id, attempt=attempt,
+                    query=pre_query, result=pre_ok, tag="pre",
+                )
                 logger.info(
                     "Pre-check step %d action=%r: %r → %s (expected %s)",
                     step_id, action, pre_query, pre_ok, pre_expected,
@@ -382,12 +386,17 @@ class Orchestrator:
             # NOT `skill_name` (the compiled task name, e.g. "refill_inventory").
             # robot_api.replay_skill looks up the manifest by sub-skill name —
             # the compiled skill_name never has a manifest of its own.
+            #
+            # `attempt` is used as the episode index so each retry runs a
+            # different recorded episode (episode 0 → episode 1 → ...).
+            # If the dataset only has one episode, lerobot-replay will error on
+            # attempt 1, which is caught below and handled as a normal failure.
             replay_error: Optional[str] = None
             try:
                 await asyncio.get_event_loop().run_in_executor(
                     None,
                     self._replay_step,
-                    action, current_params,
+                    action, current_params, attempt,
                 )
             except RuntimeError as exc:
                 # lerobot-replay exited non-zero (e.g. motor overload on disconnect).
@@ -415,6 +424,10 @@ class Orchestrator:
                 None, self._capture_frame
             )
             verified, latency_ms = self._vlm.verify(frame, query)
+            self._save_debug_frame(
+                frame, step_id=step_id, attempt=attempt,
+                query=query, result=verified, tag="post",
+            )
             # If replay hard-failed and VLM also says no, mark as not verified.
             if replay_error and not verified:
                 verified = False
@@ -516,10 +529,47 @@ class Orchestrator:
         # Should not reach here
         return False, patch_applied, last_latency_ms, failure_type
 
-    def _replay_step(self, skill_name: str, params: dict) -> None:
-        """Consume the replay_skill iterator (runs robot motion synchronously)."""
-        for _event in self._robot.replay_skill(skill_name, params):
+    def _replay_step(self, skill_name: str, params: dict, episode: int = 0) -> None:
+        """Consume the replay_skill iterator (runs robot motion synchronously).
+
+        `episode` selects which recorded episode to replay — 0 on first attempt,
+        1 on first retry, etc. This means each retry runs a genuinely different
+        recorded trajectory rather than the exact same motion.
+        """
+        for _event in self._robot.replay_skill(skill_name, params, episode=episode):
             pass  # events are logged inside robot_api; orchestrator gets them on yield
+
+    def _save_debug_frame(
+        self,
+        frame,
+        *,
+        step_id: int,
+        attempt: int,
+        query: str,
+        result: bool,
+        tag: str,
+    ) -> None:
+        """Save a JPEG of the frame that was sent to the VLM so you can inspect
+        what the camera was actually seeing at decision time.
+
+        Files land in debug_frames/ with names like:
+            s1_a0_post_True_is_the_box_now_standing_upright.jpg
+
+        The directory is created on first use and silently skipped if cv2 or
+        numpy aren't available.
+        """
+        try:
+            import cv2 as _cv2
+            import os
+            debug_dir = "debug_frames"
+            os.makedirs(debug_dir, exist_ok=True)
+            short_q = query[:50].replace(" ", "_").replace("?", "").replace("'", "")
+            fname = f"s{step_id}_a{attempt}_{tag}_{result}_{short_q}.jpg"
+            path = os.path.join(debug_dir, fname)
+            _cv2.imwrite(path, frame)
+            logger.debug("Saved debug frame → %s", path)
+        except Exception as exc:
+            logger.debug("_save_debug_frame skipped: %s", exc)
 
     def _capture_frame(self):
         """
