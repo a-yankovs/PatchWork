@@ -321,10 +321,14 @@ class Orchestrator:
             is_retry = attempt > 0
 
             # --- Execute step (run in executor to not block event loop) ---
+            # Pass `action` (the individual sub-skill, e.g. "full_pick_and_place"),
+            # NOT `skill_name` (the compiled task name, e.g. "refill_inventory").
+            # robot_api.replay_skill looks up the manifest by sub-skill name —
+            # the compiled skill_name never has a manifest of its own.
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 self._replay_step,
-                skill_name, current_params,
+                action, current_params,
             )
 
             trace_logger.log_event(

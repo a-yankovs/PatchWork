@@ -107,6 +107,36 @@ def _build_orchestrator(
 
 
 # ---------------------------------------------------------------------------
+# Keyword normalization
+# ---------------------------------------------------------------------------
+
+# Maps: any of the listed keywords appearing in the transcript → canonical command.
+# Values are (list_of_trigger_words, canonical_command).
+# Trigger words can be exact substrings OR common STT mishearings of the same word.
+_COMMAND_SHORTCUTS: list[tuple[list[str], str]] = [
+    (["inventory", "inventor", "inventori", "inventor."], "refill the inventory"),
+]
+
+
+def _normalize_command(text: str) -> str:
+    """
+    Normalize a raw transcript to a canonical skill command.
+
+    Checks every trigger word for each shortcut (case-insensitive substring match).
+    Returns the canonical command if any trigger matches, otherwise the original.
+    Handles STT mishearings by listing alternate spellings as extra triggers.
+    """
+    lowered = text.lower().strip(".!, ")
+    for triggers, canonical in _COMMAND_SHORTCUTS:
+        for kw in triggers:
+            if kw in lowered:
+                if text.strip() != canonical:
+                    print(f"   ↳ normalized {text!r} → {canonical!r}  (matched {kw!r})")
+                return canonical
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Single skill run
 # ---------------------------------------------------------------------------
 
@@ -220,6 +250,7 @@ async def _main_async(args: argparse.Namespace) -> None:
                         args.cmd if args.cmd else
                         listener.listen(f"[{iteration}] Ready. Speak your robot command.")
                     )
+                    command = _normalize_command(command)
                     await _run_once(command, orc)
                     print()  # blank line between runs
                 except KeyboardInterrupt:
@@ -230,6 +261,7 @@ async def _main_async(args: argparse.Namespace) -> None:
                 args.cmd if args.cmd else
                 listener.listen("Ready. Speak your robot command.")
             )
+            command = _normalize_command(command)
             success = await _run_once(command, orc)
             sys.exit(0 if success else 1)
 
