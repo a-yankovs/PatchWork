@@ -392,26 +392,42 @@ class Orchestrator:
             # NOT `skill_name` (the compiled task name, e.g. "refill_inventory").
             # robot_api.replay_skill looks up the manifest by sub-skill name —
             # the compiled skill_name never has a manifest of its own.
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                self._replay_step,
-                action, current_params,
-            )
+            replay_error: Optional[str] = None
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self._replay_step,
+                    action, current_params,
+                )
+            except RuntimeError as exc:
+                # lerobot-replay exited non-zero (e.g. motor overload on disconnect).
+                # Treat as a step failure so the patch/retry path can handle it
+                # rather than crashing the entire pipeline.
+                replay_error = str(exc)
+                logger.warning(
+                    "Step %d replay raised RuntimeError (attempt %d/%d): %s",
+                    step_id, attempt + 1, MAX_RETRIES_PER_STEP, replay_error,
+                )
 
             trace_logger.log_event(
                 skill=skill_name,
                 step_id=step_id,
                 action=action,
-                result="running",
+                result="running" if not replay_error else "replay_error",
                 gpu_latency_ms=None,
                 retry=is_retry,
             )
 
             # --- Capture frame and post-verify ---
+            # Even if replay errored, check the frame — the arm may have
+            # partially completed the step (e.g. overload after motion finished).
             frame = await asyncio.get_event_loop().run_in_executor(
                 None, self._capture_frame
             )
             verified, latency_ms = self._vlm.verify(frame, query)
+            # If replay hard-failed and VLM also says no, mark as not verified.
+            if replay_error and not verified:
+                verified = False
             last_latency_ms = latency_ms
 
             if verified:
