@@ -409,20 +409,30 @@ class RobotAPI:
         self._run_command(cmd)
 
     def _replay_single_step(self, dataset_repo_id: str, *, episode: int = 0) -> None:
-        # If dataset_repo_id is a local path (starts with . or /), pass --dataset.root
-        # so LeRobot knows to load from disk instead of HuggingFace.
+        # dataset_repo_id may be a local path like "./data/pick_object_v5".
+        # lerobot-replay expects:
+        #   --dataset.repo_id=pick_object_v5   (just the folder name)
+        #   --dataset.root=./data              (parent directory)
+        # Passing the full path as repo_id causes an HFValidationError.
+        repo_path = Path(dataset_repo_id)
+        if repo_path.exists():
+            repo_id = repo_path.name          # "pick_object_v5"
+            root    = str(repo_path.parent)   # "./data"
+        else:
+            # Treat as a HuggingFace repo id (e.g. "user/dataset")
+            repo_id = dataset_repo_id
+            root    = None
+
         cmd = [
             f"{self.lerobot_bin}-replay",
             "--robot.type=so101_follower",
             f"--robot.port={self.robot_port}",
             f"--robot.id={self.robot_id}",
-            f"--dataset.repo_id={dataset_repo_id}",
+            f"--dataset.repo_id={repo_id}",
             f"--dataset.episode={episode}",
         ]
-        repo_path = Path(dataset_repo_id)
-        if repo_path.exists():
-            # Local dataset — pass the parent directory as root
-            cmd += [f"--dataset.root={repo_path.parent}"]
+        if root is not None:
+            cmd += [f"--dataset.root={root}"]
         self._run_command(cmd)
 
     def _run_command(self, cmd: List[str]) -> None:

@@ -22,7 +22,7 @@ Key options:
     --cmd TEXT      Skip STT, use this text command directly
     --loop          Keep listening for commands (Ctrl+C to exit)
     --verbose       Enable DEBUG logging
-    --webcam N      Webcam device index (default 1 — AMD USB cam; use 0 for laptop built-in)
+    --webcam N      Webcam device index (default 0 — laptop built-in; AMD USB cam is 2)
     --model SIZE    Whisper model: tiny|base|small|medium (default: base)
     --record-secs N Mic recording duration in seconds (default: 5)
 """
@@ -293,8 +293,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # --- Hardware: webcam + compiler ---
     parser.add_argument(
-        "--webcam", type=int, default=1, metavar="N",
-        help="OpenCV webcam device index (default: 1 — AMD USB webcam; laptop built-in is 0)",
+        "--webcam", type=int, default=0, metavar="N",
+        help="OpenCV webcam device index (default: 0; external AMD USB webcam is 2)",
     )
     parser.add_argument(
         "--compiler", default="auto",

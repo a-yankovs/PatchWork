@@ -86,16 +86,10 @@ _DEFAULT_PARAMS = {
 SKILL_REGISTRY: dict[str, dict] = {
     "pick_object": {
         "skill_name": "pick_object",
-        "description": "Locate and pick an object from the scene into the gripper.",
+        "description": "Pick an object from the scene into the gripper.",
         "steps": [
             {
                 "step_id": 0,
-                "action": "scan_scene",
-                "verification_query": "Is there an object visible in the pick zone?",
-                "expected_result": True,
-            },
-            {
-                "step_id": 1,
                 "action": "pick_object",
                 "verification_query": "Is an object held securely in the gripper?",
                 "expected_result": True,
@@ -113,12 +107,6 @@ SKILL_REGISTRY: dict[str, dict] = {
                 "verification_query": "Is the object now placed inside the box?",
                 "expected_result": True,
             },
-            {
-                "step_id": 1,
-                "action": "scan_scene",
-                "verification_query": "Is the box now occupied with the placed object?",
-                "expected_result": True,
-            },
         ],
         "parameters": dict(_DEFAULT_PARAMS),
     },
@@ -128,18 +116,12 @@ SKILL_REGISTRY: dict[str, dict] = {
         "steps": [
             {
                 "step_id": 0,
-                "action": "scan_scene",
-                "verification_query": "Is there an object visible in the pick zone?",
-                "expected_result": True,
-            },
-            {
-                "step_id": 1,
                 "action": "pick_object",
                 "verification_query": "Is an object held securely in the gripper?",
                 "expected_result": True,
             },
             {
-                "step_id": 2,
+                "step_id": 1,
                 "action": "place_in_box",
                 "verification_query": "Is the object now placed inside the box?",
                 "expected_result": True,
@@ -153,19 +135,13 @@ SKILL_REGISTRY: dict[str, dict] = {
         "steps": [
             {
                 "step_id": 0,
-                "action": "scan_scene",
-                "verification_query": "Is there an empty slot visible on the shelf?",
-                "expected_result": True,
-            },
-            {
-                "step_id": 1,
                 "action": "pick_object",
                 "verification_query": "Is a box held securely in the gripper?",
                 "expected_result": True,
             },
             {
-                "step_id": 2,
-                "action": "move_box_to_shelf",
+                "step_id": 1,
+                "action": "box_in_shelf",
                 "verification_query": "Is a box standing upright in the shelf slot?",
                 "expected_result": True,
             },
@@ -400,10 +376,18 @@ class SkillCompiler:
 
         # [MOCK] auto fell through — neither real backend found.
         # Output is deterministic keyword routing, NOT Phi-3 inference.
+        gguf_path = model_path or _DEFAULT_GGUF_PATH
+        print(
+            f"\n⚠  No GPU compiler backend found.\n"
+            f"   llama_cpp: GGUF not found at {gguf_path!r}\n"
+            f"   onnx_rocm: onnxruntime not installed\n"
+            f"   Fix: export PHI3_GGUF_PATH=<path to .gguf file>\n"
+            f"   Falling back to mock keyword compiler.\n",
+            flush=True,
+        )
         logger.warning(
-            "No GPU backend available (llama_cpp or onnx_rocm). "
-            "Falling back to [MOCK] compiler — keyword routing only, not real Phi-3. "
-            "Set PHI3_GGUF_PATH or install llama-cpp-python for real inference."
+            "No GPU backend available — falling back to mock compiler. "
+            "GGUF path checked: %s", gguf_path,
         )
         return "mock", self._mock_engine
 
@@ -411,17 +395,29 @@ class SkillCompiler:
         try:
             from llama_cpp import Llama  # type: ignore
         except ImportError:
+            print("⚠  llama-cpp-python not installed. Run: pip install llama-cpp-python")
             logger.debug("llama-cpp-python not installed")
             return None
 
-        path = model_path or _DEFAULT_GGUF_PATH
-        if not Path(path).exists():
-            logger.debug("GGUF model not found at %s", path)
-            return None
+        path = Path(model_path or _DEFAULT_GGUF_PATH)
+        if not path.exists():
+            # Try auto-discovering any real (non-broken-symlink) .gguf file in models/
+            models_dir = Path("models")
+            candidates = [
+                p for p in (models_dir.glob("*.gguf") if models_dir.exists() else [])
+                if p.exists()  # exists() follows symlinks — filters out broken ones
+            ]
+            if candidates:
+                path = candidates[0]
+                print(f"   ↳ Auto-discovered GGUF: {path.absolute()}", flush=True)
+                logger.info("Auto-discovered GGUF model at %s", path.absolute())
+            else:
+                logger.debug("GGUF model not found at %s (no valid .gguf in models/)", path)
+                return None
 
-        logger.info("Loading Phi-3 via llama_cpp from %s", path)
+        logger.info("Loading Phi-3 via llama_cpp from %s", path.absolute())
         llm = Llama(
-            model_path=path,
+            model_path=str(path.absolute()),
             n_ctx=4096,
             n_gpu_layers=-1,   # offload all layers to ROCm GPU (HIP backend)
             verbose=False,

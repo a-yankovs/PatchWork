@@ -10,16 +10,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-<<<<<<< HEAD
-
 import cv2
 import numpy as np
-
-
-=======
-import cv2
-import numpy as np
->>>>>>> ad343f56d260fd1fc5c0712d67553c364d67d7f4
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -38,8 +30,8 @@ SKILL_STEPS = [
     {"step_id": 4, "action": "check_box_empty", "label": "Check Done"},
 ]
 
-# Indices 1, 2 = external USB webcams (index 0 = laptop built-in, skipped).
-CAMERA_INDICES = [1, 2]
+# Index 0 = laptop built-in cam, index 2 = external USB webcam. Index 1 unavailable.
+CAMERA_INDICES = [0, 2]
 CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
 
 RESULT_COLOR = {
@@ -125,7 +117,7 @@ class _CameraServer:
     def _open_sync(self) -> None:
         new_handles = []
         for idx in CAMERA_INDICES:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
@@ -167,7 +159,7 @@ class _CameraServer:
                             continue
                         if self._handles[idx] is None:
                             # Try to reconnect
-                            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
                             if cap.isOpened():
                                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
                                 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
