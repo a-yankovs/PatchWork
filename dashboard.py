@@ -41,6 +41,170 @@ REACT_PHASES = [
 ]
 
 
+MJPEG_PORT = 8765
+
+
+class _CameraServer:
+    """MJPEG server — streams camera frames directly to the browser, bypassing Streamlit."""
+
+    def __init__(self) -> None:
+        self._lock              = threading.Lock()
+        self._handles: list[cv2.VideoCapture | None] = []
+        self._streaming_enabled = False
+        self._health_check_thread = None
+        self._health_check_stop = False
+        self._start_http()
+        self._start_health_check()
+
+    # ── HTTP server ────────────────────────────────────────────────────────────
+    def _start_http(self) -> None:
+        srv = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                path = self.path.split("?")[0]
+                if not (path.startswith("/cam") and path[4:].isdigit()):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                idx = int(path[4:])
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                while srv._streaming_enabled:
+                    data = srv._next_jpeg(idx)
+                    if data is None:
+                        # Should not happen now, but handle gracefully
+                        time.sleep(0.01)
+                        continue
+                    try:
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
+                        )
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", MJPEG_PORT), _Handler)
+        # allow fast restart without "address already in use" on page refresh
+        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    # ── camera lifecycle ───────────────────────────────────────────────────────
+    def open(self) -> None:
+        # VideoCapture init blocks 1-4s on Windows/DirectShow — fire to a
+        # background thread so the <img> tag renders immediately and frames
+        # stream in as soon as the camera is ready.
+        with self._lock:
+            self._streaming_enabled = True
+            self._health_check_stop = False
+        threading.Thread(target=self._open_sync, daemon=True).start()
+
+    def _open_sync(self) -> None:
+        new_handles = []
+        for idx in CAMERA_INDICES:
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                new_handles.append(cap)
+            else:
+                cap.release()
+                new_handles.append(None)
+        with self._lock:
+            for cap in self._handles:
+                if cap:
+                    cap.release()
+            self._handles = new_handles
+
+    def close(self) -> None:
+        with self._lock:
+            self._streaming_enabled = False
+            self._health_check_stop = True
+            for cap in self._handles:
+                if cap:
+                    cap.release()
+            self._handles = []
+
+    def _start_health_check(self) -> None:
+        """Start background thread that monitors and reconnects cameras."""
+        def health_check_loop() -> None:
+            while not self._health_check_stop:
+                time.sleep(1.0)  # Check every 1 second
+                
+                if not self._streaming_enabled or self._health_check_stop:
+                    continue
+                
+                with self._lock:
+                    # Try to re-open any cameras marked as None
+                    for idx in CAMERA_INDICES:
+                        if idx >= len(self._handles):
+                            continue
+                        if self._handles[idx] is None:
+                            # Try to reconnect
+                            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                            if cap.isOpened():
+                                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+                                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                                cap.set(cv2.CAP_PROP_FPS, 30)
+                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                                self._handles[idx] = cap
+                            else:
+                                cap.release()
+        
+        self._health_check_thread = threading.Thread(target=health_check_loop, daemon=True)
+        self._health_check_thread.start()
+
+    # ── frame production ───────────────────────────────────────────────────────
+    def _next_jpeg(self, idx: int) -> bytes | None:
+        with self._lock:
+            if not self._streaming_enabled or idx >= len(self._handles):
+                return self._blank_frame()
+            cap = self._handles[idx]
+            if cap is None:
+                # Camera was never available
+                return self._blank_frame()
+        
+        # Read outside the lock for speed
+        ret, frame_bgr = cap.read()
+        
+        # If read fails (camera unplugged), mark as unavailable
+        if not ret or not cap.isOpened():
+            with self._lock:
+                if idx < len(self._handles) and self._handles[idx] is cap:
+                    cap.release()
+                    self._handles[idx] = None
+            return self._blank_frame()
+        
+        # Resize and encode as fast as possible
+        frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
+        # Use fast JPEG encoding (quality 75 for speed, still good quality)
+        _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        return buf.tobytes()
+
+    def _blank_frame(self, width: int = 480, height: int = 360) -> bytes:
+        """Generate a black placeholder frame (cached for speed)."""
+        # Create once and reuse
+        if not hasattr(self, '_blank_cache'):
+            blank = np.zeros((height, width, 3), dtype=np.uint8)
+            _, buf = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            self._blank_cache = buf.tobytes()
+        return self._blank_cache
+
+
+@st.cache_resource
+def _camera_server() -> _CameraServer:
+    return _CameraServer()
+
+
 def load_trace() -> list[dict]:
     if not TRACE_FILE.exists():
         return []
@@ -123,7 +287,7 @@ with col_title:
     <span style='color:#ED1C24;'>Skill</span>Patch
 </h1>
 <p style='color:#8892A4; margin:2px 0 0 0; font-size:0.95rem;'>
-    Self-Healing Robot Execution Layer &nbsp;·&nbsp; On-device · No cloud · No engineer
+    Self-Healing Robot Execution Layer
 </p>""", unsafe_allow_html=True)
 with col_badge:
     st.markdown("""
@@ -132,7 +296,7 @@ with col_badge:
                  border-radius:4px; font-size:0.75rem; font-weight:600;'>
         AMD Ryzen AI NPU
     </span><br/>
-    <span style='color:#8892A4; font-size:0.72rem;'>Moondream2 INT4 · Phi-3-mini · LeRobot SO-100</span>
+    <span style='color:#8892A4; font-size:0.72rem;'>Phi-3-mini · LeRobot SO-100</span>
 </div>""", unsafe_allow_html=True)
 
 st.markdown("<hr style='border-color:#2D3748; margin:0.5rem 0;'>", unsafe_allow_html=True)
@@ -359,7 +523,7 @@ def live_dashboard() -> None:
         rows = []
         for e in reversed(skill_events[-60:]):
             rows.append({
-                "Time":    datetime.fromtimestamp(e.get("timestamp", 0)).strftime("%H:%M:%S"),
+                "Timestamp": datetime.fromtimestamp(e.get("timestamp", 0)).strftime("%H:%M:%S"),
                 "Step":    e.get("step_id", "—"),
                 "Action":  e.get("action", "—"),
                 "Result":  e.get("result", "—"),
@@ -401,4 +565,51 @@ def live_dashboard() -> None:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+@st.fragment(run_every=0.5)
+def camera_feeds() -> None:
+    srv = _camera_server()
+
+    cam_header, cam_toggle = st.columns([5, 1])
+    with cam_header:
+        st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:6px 0 4px 0;'>LIVE CAMERA FEEDS</p>",
+                    unsafe_allow_html=True)
+    with cam_toggle:
+        cameras_on = st.toggle("Enable Camera", key="cameras_enabled", value=False)
+
+    # open/close only on toggle edge; cache-bust token forces browser to make a
+    # fresh HTTP request on re-enable (same URL would reuse the dead connection)
+    was_on = st.session_state.get("_cam_was_on", False)
+    if cameras_on and not was_on:
+        srv.open()
+        st.session_state["_cam_token"] = int(time.time())
+    elif not cameras_on and was_on:
+        srv.close()
+    st.session_state["_cam_was_on"] = cameras_on
+
+    if cameras_on:
+        token = st.session_state.get("_cam_token", 0)
+        cam_cols = st.columns(2)
+        for i, label in enumerate(CAMERA_LABELS):
+            with cam_cols[i]:
+                st.markdown(
+                    f"<img src='http://localhost:{MJPEG_PORT}/cam{i}?t={token}' "
+                    f"style='width:100%;border-radius:8px;display:block;' alt='{label}'>"
+                    f"<p style='color:#8892A4;font-size:0.75rem;text-align:center;margin:4px 0 0;'>"
+                    f"{label}</p>",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.markdown(
+            "<div style='background:#161B27;border:1px dashed #2D3748;border-radius:8px;"
+            "padding:16px;text-align:center;color:#4A5568;font-size:0.8rem;'>"
+            "Toggle <b style='color:#8892A4;'>Enable Camera</b> above to activate AMD webcams"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+
+if "session_start" not in st.session_state:
+    st.session_state.session_start = datetime.now().timestamp()
+
+camera_feeds()
 live_dashboard()
