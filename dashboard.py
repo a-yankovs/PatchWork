@@ -5,6 +5,7 @@
 import json
 import socket
 import threading
+import math
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -113,6 +114,89 @@ REACT_PHASES = [
 
 MJPEG_PORT = 8765
 
+ROBOT_OVERLAY_ENABLED = True
+
+# Per-camera manually tuned anchor points in image pixels.
+# You will tweak these by eye once you see the stream.
+CAMERA_OVERLAY_CONFIG = {
+    0: {  # Follower — Top
+        "base": (240, 300),
+        "l1": 90,   # base -> shoulder
+        "l2": 95,   # shoulder -> elbow
+        "l3": 75,   # elbow -> wrist
+        "l4": 45,   # wrist -> gripper
+    },
+    1: {  # Follower — Side
+        "base": (260, 300),
+        "l1": 95,
+        "l2": 100,
+        "l3": 80,
+        "l4": 45,
+    },
+}
+
+def _pt_from_angle(origin, length, angle_deg):
+    a = math.radians(angle_deg)
+    x = int(origin[0] + length * math.cos(a))
+    y = int(origin[1] - length * math.sin(a))
+    return (x, y)
+
+def get_demo_joint_angles():
+    """
+    Replace this with real robot joint angles later.
+    For now this makes the overlay visibly animate if you want a quick test.
+    """
+    t = time.time()
+    return {
+        "shoulder": 80 + 10 * math.sin(t * 1.2),
+        "elbow":    35 + 20 * math.sin(t * 1.7),
+        "wrist":   -10 + 12 * math.sin(t * 2.0),
+        "gripper":   5,
+    }
+
+def draw_robot_overlay(frame, slot: int):
+    if not ROBOT_OVERLAY_ENABLED:
+        return frame
+
+    cfg = CAMERA_OVERLAY_CONFIG.get(slot)
+    if cfg is None:
+        return frame
+
+    # later: replace this with actual robot telemetry
+    q = get_demo_joint_angles()
+
+    base = cfg["base"]
+
+    # Very simple planar chain for visual motion
+    shoulder = _pt_from_angle(base, cfg["l1"], q["shoulder"])
+    elbow    = _pt_from_angle(shoulder, cfg["l2"], q["shoulder"] - q["elbow"])
+    wrist    = _pt_from_angle(elbow, cfg["l3"], q["shoulder"] - q["elbow"] + q["wrist"])
+    gripper  = _pt_from_angle(wrist, cfg["l4"], q["shoulder"] - q["elbow"] + q["wrist"])
+
+    segments = [
+        (base, shoulder),
+        (shoulder, elbow),
+        (elbow, wrist),
+        (wrist, gripper),
+    ]
+
+    # draw lines
+    for p1, p2 in segments:
+        cv2.line(frame, p1, p2, (0, 255, 0), 3)
+
+    # draw joints
+    for p, label in [
+        (base, "base"),
+        (shoulder, "shoulder"),
+        (elbow, "elbow"),
+        (wrist, "wrist"),
+        (gripper, "gripper"),
+    ]:
+        cv2.circle(frame, p, 5, (0, 0, 255), -1)
+        cv2.putText(frame, label, (p[0] + 6, p[1] - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    return frame
 
 class _CameraServer:
     """MJPEG server — streams camera frames directly to the browser, bypassing Streamlit."""
@@ -244,21 +328,24 @@ class _CameraServer:
 
     # ── frame production ───────────────────────────────────────────────────────
     def _next_jpeg(self, slot: int) -> bytes:
-        # hold lock for full read so close() cannot release the cap mid-read
-        with self._lock:
-            if not self._streaming_enabled or slot >= len(self._handles):
-                return self._placeholder()
-            cap = self._handles[slot]
-            if cap is None:
-                return self._placeholder()
-            ret, frame_bgr = cap.read()
-            if not ret:
-                cap.release()
-                self._handles[slot] = None
-                return self._placeholder()
-        frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
-        _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        return buf.tobytes()
+    # hold lock for full read so close() cannot release the cap mid-read
+    with self._lock:
+        if not self._streaming_enabled or slot >= len(self._handles):
+            return self._placeholder()
+        cap = self._handles[slot]
+        if cap is None:
+            return self._placeholder()
+        ret, frame_bgr = cap.read()
+        if not ret:
+            cap.release()
+            self._handles[slot] = None
+            return self._placeholder()
+
+    frame_bgr = draw_robot_overlay(frame_bgr, slot)
+
+    frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
+    _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return buf.tobytes()
 
     def _placeholder(self) -> bytes:
         if not hasattr(self, "_placeholder_cache"):
