@@ -22,7 +22,7 @@ Key options:
     --cmd TEXT      Skip STT, use this text command directly
     --loop          Keep listening for commands (Ctrl+C to exit)
     --verbose       Enable DEBUG logging
-    --webcam N      Webcam device index (default 0)
+    --webcam N      Webcam device index (default 1 — AMD USB cam; use 0 for laptop built-in)
     --model SIZE    Whisper model: tiny|base|small|medium (default: base)
     --record-secs N Mic recording duration in seconds (default: 5)
 """
@@ -36,6 +36,7 @@ import sys
 from typing import Optional
 
 from .orchestrator import Orchestrator, MockRobotAPI, MockVLMAPI, SkillAbortError
+from .audio_feedback import AudioFeedback
 from .stt import SpeechListener
 from .webcam_stream import WebcamStream
 
@@ -78,12 +79,14 @@ def _build_orchestrator(
             compiler_backend="mock",
             webcam_index=webcam_index,
             frame_source=frame_source,
+            audio=AudioFeedback(enabled=False),  # no ElevenLabs calls in mock mode
         )
 
     return Orchestrator(
         compiler_backend=compiler_backend,
         webcam_index=webcam_index,
         frame_source=frame_source,
+        # AudioFeedback() default: reads ELEVENLABS_API_KEY from env
     )
 
 
@@ -131,7 +134,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     print(f"  • STT        → {stt_status}")
     if args.mock:
         print("  • SLM        → mock compiler (no Phi-3 needed)")
-        print("  • Webcam     → synthetic blank frames")
+        print(f"  • Webcam     → device {args.webcam} (AMD USB cam)")
         print("  • VLM        → MockVLMAPI (step 1 fails once, then auto-patches)")
         print("  • Robot      → MockRobotAPI (motion simulated)")
         print("  • Audio      → print-only (no ElevenLabs)")
@@ -144,15 +147,16 @@ async def _main_async(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Start webcam stream
     # ------------------------------------------------------------------
-    cam = WebcamStream(index=args.webcam, mock=args.mock)
+    # Always use the real camera (never synthetic frames) — mock mode only
+    # affects robot/VLM/compiler, not the webcam feed.
+    cam = WebcamStream(index=args.webcam, mock=False)
     try:
         cam.start()
     except RuntimeError as exc:
-        if not args.mock:
-            print(f"\n⚠  Webcam error: {exc}")
-            print("   Switching to mock webcam (blank frames).")
-            cam = WebcamStream(mock=True)
-            cam.start()
+        print(f"\n⚠  Webcam error: {exc}")
+        print("   Switching to synthetic blank frames.")
+        cam = WebcamStream(mock=True)
+        cam.start()
 
     try:
         # ------------------------------------------------------------------
@@ -233,8 +237,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # --- Hardware ---
     parser.add_argument(
-        "--webcam", type=int, default=0, metavar="N",
-        help="OpenCV webcam device index (default: 0)",
+        "--webcam", type=int, default=1, metavar="N",
+        help="OpenCV webcam device index (default: 1 — AMD USB webcam; laptop built-in is 0)",
     )
     parser.add_argument(
         "--compiler", default="auto",
