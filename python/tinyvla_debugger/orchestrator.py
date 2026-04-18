@@ -25,18 +25,9 @@ It owns the state machine for skill execution:
             → if FAIL: log abort, raise SkillAbortError (max retries hit)
     → log SkillComplete
 
-During hours 9-14, robot_api and vlm_api are MOCKED. See MockRobotAPI
-and MockVLMAPI below — swap them in via Orchestrator(robot=..., vlm=...).
-
-Usage (with real hardware):
+Usage:
     orc = Orchestrator()
     asyncio.run(orc.run_skill("Put the canned goods on the middle shelf"))
-
-Usage (with mocks — for testing orchestration logic):
-    robot = MockRobotAPI(failure_on_step=1)
-    vlm   = MockVLMAPI(fail_step_ids={1})
-    orc   = Orchestrator(robot=robot, vlm=vlm, compiler_backend="mock")
-    asyncio.run(orc.run_skill("Stock the shelf"))
 """
 
 from __future__ import annotations
@@ -155,9 +146,8 @@ class Orchestrator:
         # Layer 1
         self.compiler = SkillCompiler(backend=compiler_backend)
 
-        # Layer 2 — robot (real or mock)
-        # Pass a RobotAPI instance explicitly for real hardware, or MockRobotAPI for tests.
-        # Auto-instantiation from env vars is the fallback when no robot is provided.
+        # Layer 2 — robot
+        # Pass a RobotAPI instance explicitly, or omit to auto-instantiate from env vars.
         if robot is not None:
             self._robot = robot
         else:
@@ -222,12 +212,6 @@ class Orchestrator:
         skill_name = skill["skill_name"]
         base_params = dict(skill["parameters"])
 
-        # --- Pre-apply known patches ---
-        preexisting = self.patch_library.get_preexisting_patches(skill_name)
-        params = self.patch_library.apply_to_params(base_params, preexisting)
-        if preexisting:
-            logger.info("Pre-applied patches for %s: %s", skill_name, preexisting)
-
         result = SkillResult(skill_name=skill_name, outcome="success")
 
         # --- Step loop ---
@@ -240,7 +224,7 @@ class Orchestrator:
 
             step_passed, patch_was_applied, latency_ms, failure_type = (
                 await self._execute_step_with_retry(
-                    skill_name, step_id, action, query, params
+                    skill_name, step_id, action, query, base_params
                 )
             )
 
@@ -328,8 +312,14 @@ class Orchestrator:
         """
         patch_applied    = False
         last_latency_ms  = None
-        current_params   = dict(params)
         failure_type     = None
+
+        # Pre-apply any patches that have worked for this action before.
+        # Keyed by action (e.g. "box_in_shelf"), not compiled skill_name.
+        preexisting = self.patch_library.get_preexisting_patches(action)
+        current_params = self.patch_library.apply_to_params(dict(params), preexisting)
+        if preexisting:
+            logger.info("Pre-applied patches for action %s: %s", action, preexisting)
 
         for attempt in range(MAX_RETRIES_PER_STEP):
             is_retry = attempt > 0
@@ -380,10 +370,10 @@ class Orchestrator:
                             retry=is_retry,
                         )
                         return False, patch_applied, last_latency_ms, failure_type
-                    patch = self.patch_library.get_patch(skill_name, failure_type)
+                    patch = self.patch_library.get_patch(action, failure_type)
                     if patch:
                         current_params = self.patch_library.apply_to_params(current_params, patch)
-                        self._robot.apply_patch(skill_name, patch)
+                        self._robot.apply_patch(action, patch)
                         patch_applied = True
                     continue  # retry the attempt loop from the top (pre-check again)
 
@@ -438,7 +428,7 @@ class Orchestrator:
                     action=action,
                     result=outcome,
                     gpu_latency_ms=latency_ms,
-                    patch_applied=self.patch_library.get_patch(skill_name, failure_type)
+                    patch_applied=self.patch_library.get_patch(action, failure_type)
                         if patch_applied and failure_type else None,
                     retry=is_retry,
                 )
@@ -448,9 +438,9 @@ class Orchestrator:
 
                 if patch_applied and failure_type:
                     # Store the patch that worked
-                    successful_patch = self.patch_library.get_patch(skill_name, failure_type)
-                    self.patch_library.store_patch(skill_name, failure_type, successful_patch)
-                    logger.info("Patch worked — stored %s:%s", skill_name, failure_type)
+                    successful_patch = self.patch_library.get_patch(action, failure_type)
+                    self.patch_library.store_patch(action, failure_type, successful_patch)
+                    logger.info("Patch worked — stored %s:%s", action, failure_type)
 
                 return True, patch_applied, last_latency_ms, failure_type
 
@@ -498,7 +488,7 @@ class Orchestrator:
                     )
 
             # --- Apply patch and retry ---
-            patch = self.patch_library.get_patch(skill_name, failure_type)
+            patch = self.patch_library.get_patch(action, failure_type)
 
             trace_logger.log_event(
                 skill=skill_name,
@@ -514,7 +504,7 @@ class Orchestrator:
             if patch or reloc_delta:
                 if patch:
                     current_params = self.patch_library.apply_to_params(current_params, patch)
-                    self._robot.apply_patch(skill_name, patch)
+                    self._robot.apply_patch(action, patch)
                 patch_applied = True
                 logger.info(
                     "Patch applied: %s (reloc: %s) — retrying step %d",
@@ -605,155 +595,3 @@ class Orchestrator:
         return delta
 
 
-# ---------------------------------------------------------------------------
-# [MOCK] Test doubles — used when running with --mock or in unit tests.
-#
-# To switch to real hardware, pass the real modules to Orchestrator:
-#   import robot_api, vlm_api
-#   orc = Orchestrator(robot=robot_api, vlm=vlm_api)   # [REAL]
-#   orc = Orchestrator(robot=MockRobotAPI(), vlm=MockVLMAPI())  # [MOCK]
-# ---------------------------------------------------------------------------
-
-class MockRobotAPI:
-    """
-    [MOCK] Simulates robot_api without hardware.
-
-    Yields synthetic StepEvents and records applied patches in memory.
-    Use failure_on_step to inject a gripper failure on a specific step,
-    which exercises the classifier → patch → retry path in the orchestrator.
-
-    [REAL] Replace by passing the real robot_api module:
-        from tinyvla_debugger import robot_api
-        orc = Orchestrator(robot=robot_api)
-
-    Args:
-        failure_on_step: Step index whose gripper_state is forced "open"
-                         (simulates a grasp failure). Set to -1 for no failures.
-        num_steps:       Steps emitted per replay_skill call.
-    """
-
-    def __init__(self, failure_on_step: int = -1, num_steps: int = 4) -> None:
-        self.failure_on_step = failure_on_step
-        self.num_steps = num_steps
-        self._patches: dict[str, dict] = {}
-        logger.debug("MockRobotAPI initialized (failure_on_step=%d)", failure_on_step)
-
-    def replay_skill(self, skill_name: str, params: dict) -> Iterator[Any]:
-        from .robot_api import StepEvent
-        for i in range(self.num_steps):
-            # [MOCK] gripper_state and action name are synthetic.
-            # [REAL] RobotAPI yields StepEvents from the SO-100 arm
-            #        with live gripper sensor readings and the actual
-            #        trajectory action name.
-            gripper = "open" if i == self.failure_on_step else "closed"
-            yield StepEvent(
-                skill_name=skill_name,
-                step_id=i,
-                action=skill_name,
-                timestamp=time.time(),
-                dataset_repo_id=f"mock/{skill_name}_step_{i}",
-                gripper_state=gripper,
-                params_used=dict(params),
-                result="EXECUTED",
-            )
-
-    def apply_patch(self, skill_name: str, patch: dict) -> None:
-        # [MOCK] Stores patch in memory only — nothing written to disk.
-        # [REAL] robot_api.apply_patch() writes deltas to the trajectory config.
-        self._patches.setdefault(skill_name, {}).update(patch)
-        logger.debug("MockRobotAPI.apply_patch(%s, %s)", skill_name, patch)
-
-    def record_skill(self, skill_name: str) -> None:
-        # [MOCK] No-op.
-        # [REAL] robot_api.record_skill() runs LeRobot teleoperation recording.
-        logger.debug("MockRobotAPI.record_skill(%s) — no-op in mock", skill_name)
-
-
-class MockVLMAPI:
-    """
-    [MOCK] Simulates vlm_api without Ollama / ROCm GPU.
-
-    By default every verify() call returns True (success). Pass step IDs
-    in fail_step_ids to make those steps fail on the first attempt and
-    pass on retry — this exercises the classifier → patch → retry path.
-
-    Note: when a real numpy frame is passed (e.g. from WebcamStream in mock
-    mode), step_id detection returns -1 and all calls succeed. To test the
-    failure path, unit tests should set frame._mock_step_id directly.
-
-    [REAL] Replace by passing the real vlm_api module:
-        from tinyvla_debugger import vlm_api
-        orc = Orchestrator(vlm=vlm_api)
-        # Requires: ollama pull moondream-verify && ollama serve
-
-    Args:
-        fail_step_ids: Step IDs that return False on attempt 1, True on retry.
-        latency_ms:    Simulated inference latency in milliseconds.
-    """
-
-    def __init__(
-        self,
-        fail_step_ids: set[int] | None = None,
-        latency_ms: float = 95.0,   # [MOCK] hardcoded; [REAL] measured ROCm wall-clock time
-    ) -> None:
-        self.fail_step_ids = fail_step_ids or set()
-        self.latency_ms = latency_ms
-        self._call_counts: dict[int, int] = {}
-
-    def verify(self, frame: Any, query: str) -> tuple[bool, float]:
-        # [MOCK] Step detection via synthetic frame attribute.
-        # Real numpy frames (WebcamStream) have no _mock_step_id → always pass.
-        step_id = getattr(frame, "_mock_step_id", -1)
-        count = self._call_counts.get(step_id, 0)
-        self._call_counts[step_id] = count + 1
-
-        if step_id in self.fail_step_ids and count == 0:
-            # [MOCK] Simulated first-attempt failure to exercise patch path.
-            # [REAL] vlm_api.verify() POSTs the live frame to Moondream2 via
-            #        Ollama and parses "yes"/"no" from the model response.
-            logger.debug("MockVLMAPI.verify — step %d attempt 1 → False", step_id)
-            return False, self.latency_ms
-
-        # [MOCK] Simulated success.
-        # [REAL] Returns actual Moondream2 inference result + measured latency.
-        return True, self.latency_ms
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-async def _main(command: str, mock: bool = False) -> None:
-    if mock:
-        logger.info("Running with MOCK hardware interfaces")
-        robot = MockRobotAPI(failure_on_step=1)   # step 1 fails first time
-        vlm   = MockVLMAPI(fail_step_ids={1})
-        orc   = Orchestrator(
-            robot=robot, vlm=vlm, compiler_backend="mock"
-        )
-    else:
-        orc = Orchestrator()
-
-    try:
-        result = await orc.run_skill(command)
-        print(f"✓ Skill complete: {result.skill_name}")
-        print(f"  Steps executed : {result.steps_executed}")
-        print(f"  Steps patched  : {result.steps_patched}")
-        print(f"  Total GPU time : {result.total_gpu_ms:.1f}ms")
-    except SkillAbortError as e:
-        print(f"✗ Skill aborted: {e}")
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="SkillPatch orchestrator")
-    parser.add_argument("command", nargs="?",
-                        default="Put the canned goods on the middle shelf")
-    parser.add_argument("--mock", action="store_true",
-                        help="Use mock robot and VLM interfaces (no hardware needed)")
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
-    asyncio.run(_main(args.command, mock=args.mock))

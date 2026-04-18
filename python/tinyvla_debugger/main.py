@@ -35,7 +35,7 @@ import logging
 import sys
 from typing import Optional
 
-from .orchestrator import Orchestrator, MockRobotAPI, MockVLMAPI, SkillAbortError
+from .orchestrator import Orchestrator, SkillAbortError
 from .audio_feedback import AudioFeedback
 from .robot_api import RobotAPI
 from .stt import SpeechListener
@@ -60,7 +60,6 @@ _BANNER = """
 # ---------------------------------------------------------------------------
 
 def _build_orchestrator(
-    mock: bool,
     webcam_index: int,
     frame_source,
     compiler_backend: str,
@@ -70,26 +69,7 @@ def _build_orchestrator(
     teleop_id: str,
     storage_dir: str,
 ) -> Orchestrator:
-    """
-    Build the orchestrator with the right backends.
-
-    Mock mode:   MockRobotAPI + MockVLMAPI + mock compiler (no hardware needed)
-    Real mode:   RobotAPI(SO-100) + vlm_api(Moondream2) + Phi-3 compiler
-    """
-    if mock:
-        robot = MockRobotAPI(failure_on_step=1)  # step 1 fails on first attempt → exercises patch path
-        vlm   = MockVLMAPI(fail_step_ids={1})
-        return Orchestrator(
-            robot=robot,
-            vlm=vlm,
-            compiler_backend="mock",
-            webcam_index=webcam_index,
-            frame_source=frame_source,
-            audio=AudioFeedback(enabled=False),  # no ElevenLabs calls in mock mode
-        )
-
-    # [REAL] Instantiate hardware-backed RobotAPI.
-    # Ports/IDs come from CLI args (or env var fallbacks set in main()).
+    """Build the orchestrator with hardware-backed RobotAPI and Phi-3 compiler."""
     robot = RobotAPI(
         robot_port=robot_port,
         teleop_port=teleop_port,
@@ -169,35 +149,23 @@ async def _run_once(command: str, orc: Orchestrator) -> bool:
 async def _main_async(args: argparse.Namespace) -> None:
     print(_BANNER)
 
-    mode_tag = "[MOCK]" if args.mock else "[REAL]"
-    print(f"\nMode: {mode_tag}")
-    # STT status is independent of --mock: mic works unless --cmd skips it entirely
     stt_status = (
         "skip (--cmd provided)"
         if args.cmd is not None
         else f"faster-whisper ({args.model}), {args.record_secs:.0f}s window"
     )
-    print(f"  • STT        → {stt_status}")
-    if args.mock:
-        print("  • SLM        → mock compiler (no Phi-3 needed)")
-        print(f"  • Webcam     → device {args.webcam} (AMD USB cam)")
-        print("  • VLM        → MockVLMAPI (step 1 fails once, then auto-patches)")
-        print("  • Robot      → MockRobotAPI (motion simulated)")
-        print("  • Audio      → print-only (no ElevenLabs)")
-    else:
-        print(f"  • SLM        → Phi-3-mini ({args.compiler})")
-        print(f"  • Webcam     → device {args.webcam}")
-        print("  • VLM        → Moondream2 via Ollama (localhost:11434)")
-        print(f"  • Robot      → SO-100 follower ({args.robot_port}, id={args.robot_id})")
-        print(f"  • Teleop     → SO-100 leader  ({args.teleop_port}, id={args.teleop_id})")
-        print(f"  • Storage    → {args.storage_dir}")
-        print("  • Audio      → ElevenLabs TTS (ELEVENLABS_API_KEY)")
+    print(f"\n  • STT        → {stt_status}")
+    print(f"  • SLM        → Phi-3-mini ({args.compiler})")
+    print(f"  • Webcam     → device {args.webcam}")
+    print("  • VLM        → Moondream2 via Ollama (localhost:11434)")
+    print(f"  • Robot      → SO-100 follower ({args.robot_port}, id={args.robot_id})")
+    print(f"  • Teleop     → SO-100 leader  ({args.teleop_port}, id={args.teleop_id})")
+    print(f"  • Storage    → {args.storage_dir}")
+    print("  • Audio      → ElevenLabs TTS (ELEVENLABS_API_KEY)")
 
     # ------------------------------------------------------------------
     # Start webcam stream
     # ------------------------------------------------------------------
-    # Always use the real camera (never synthetic frames) — mock mode only
-    # affects robot/VLM/compiler, not the webcam feed.
     cam = WebcamStream(index=args.webcam, mock=False)
     try:
         cam.start()
@@ -212,7 +180,6 @@ async def _main_async(args: argparse.Namespace) -> None:
         # Build orchestrator — frame_source wires in the streaming webcam
         # ------------------------------------------------------------------
         orc = _build_orchestrator(
-            mock=args.mock,
             webcam_index=args.webcam,
             frame_source=cam.get_latest_frame,
             compiler_backend=args.compiler,
@@ -224,13 +191,10 @@ async def _main_async(args: argparse.Namespace) -> None:
         )
 
         # ------------------------------------------------------------------
-        # Build STT listener
+        # Build STT listener (faster-whisper + sounddevice)
         # ------------------------------------------------------------------
-        # STT is independent of --mock: microphone + faster-whisper always runs
-        # unless --cmd is given (which bypasses STT entirely).
-        # [REAL] faster-whisper + sounddevice — loads regardless of --mock flag
-        # [SKIP] if --cmd is provided, SpeechListener is still built but listen()
-        #        is never called (command comes from args.cmd instead)
+        # If --cmd is provided, SpeechListener is built but listen() is never
+        # called — the command comes from args.cmd directly.
         listener = SpeechListener(
             mock=(args.cmd is not None),
             model_size=args.model,
@@ -281,11 +245,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         epilog=__doc__,
     )
 
-    # --- Mode ---
-    parser.add_argument(
-        "--mock", action="store_true",
-        help="Mock mode — no GPU or camera required; STT (mic) still runs unless --cmd is given",
-    )
     parser.add_argument(
         "--cmd", default=None, metavar="TEXT",
         help="Skip STT; use this text command directly",
@@ -302,7 +261,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="SLM compiler backend (default: auto — tries llama_cpp then onnx_rocm)",
     )
 
-    # --- Hardware: robot arm (real mode only, ignored in --mock) ---
+    # --- Hardware: robot arm ---
     import os
     parser.add_argument(
         "--robot-port", default=os.environ.get("ROBOT_PORT", "/dev/ttyACM1"),

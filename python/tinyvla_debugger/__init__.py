@@ -30,7 +30,6 @@ Module map  (owner — mock status)
 
   orchestrator.py   Layer 5  — central control loop           (Vera)
     [REAL] always active; uses injected robot/VLM backends
-    [MOCK] MockRobotAPI + MockVLMAPI available for testing without hardware
 
   trace_logger.py   Layer 6  — execution trace to trace.jsonl (Elias)
     [REAL] always active

@@ -78,11 +78,7 @@ class WebcamStream:
     def start(self) -> "WebcamStream":
         """Open the camera and start the capture thread. Returns self."""
         if self.mock:
-            # [MOCK] Synthetic grey frame with timestamp overlay.
-            # No camera hardware required. get_latest_frame() returns this
-            # array on every call — sufficient for MockVLMAPI to receive a
-            # valid numpy input without crashing.
-            # [REAL] Remove mock=True and provide a real webcam index.
+            # Synthetic grey frame fallback — used when the real camera fails to open.
             self._frame = np.full(
                 (self._height, self._width, 3), fill_value=100, dtype=np.uint8
             )
