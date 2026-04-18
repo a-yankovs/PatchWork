@@ -24,6 +24,10 @@ SKILL_STEPS = [
     {"step_id": 4, "action": "check_box_empty", "label": "Check Done"},
 ]
 
+# Indices 1, 2 = external USB webcams (index 0 = laptop built-in, skipped).
+CAMERA_INDICES = [1, 2]
+CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
+
 RESULT_COLOR = {
     "PASS":    "#00D4AA",
     "PATCHED": "#FF8C00",
