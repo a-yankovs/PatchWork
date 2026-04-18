@@ -53,6 +53,10 @@ DEFAULT_PATCHES: dict[str, dict] = {
     "PLACEMENT_MISS":      {"approach_angle_deg": 10.0},
     "PLACEMENT_COLLISION": {"speed_scale": 0.7},        # absolute, not delta
     "DROP_DURING_TRANSIT": {"gripper_close_force": 0.1},
+    # OBJECT_NOT_FOUND: conservative z raise as fallback if VLM re-localisation
+    # cannot pinpoint the object. The orchestrator applies positional deltas from
+    # locate_object() first; this patch is used only if that fails entirely.
+    "OBJECT_NOT_FOUND":    {"z_offset_mm": 8.0, "approach_angle_deg": 5.0},
 }
 
 # Parameters whose patches are absolute values (replace, don't add)

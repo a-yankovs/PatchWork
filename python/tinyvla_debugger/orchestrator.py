@@ -47,7 +47,7 @@ from typing import Any, Iterator, Optional, Protocol
 import cv2  # webcam capture — pip install opencv-python-headless
 
 from .audio_feedback import AudioFeedback
-from .classifier import FailureClassifier
+from .classifier import FailureClassifier, OBJECT_NOT_FOUND
 from .compiler import SkillCompiler
 from .patch_library import PatchLibrary
 from . import trace_logger
@@ -250,6 +250,37 @@ class Orchestrator:
                     skill_name, result.steps_executed, result.steps_patched)
         return result
 
+    async def run_from_webcam(self) -> SkillResult:
+        """
+        Capture a webcam frame, route to a skill via VLM scene queries,
+        then execute that skill.
+
+        This is the primary entry point for autonomous operation — no NL
+        command needed. The skill router asks Moondream2 a short sequence
+        of yes/no questions to determine which of the four canonical skills
+        (pick_object, place_in_box, full_pick_and_place, box_in_shelf)
+        best matches the current scene.
+
+        Because the routed skill name is a key in compiler.SKILL_REGISTRY,
+        run_skill() returns the static program immediately without calling
+        the Phi-3 LLM.
+
+        Returns:
+            SkillResult — same as run_skill().
+
+        Raises:
+            SkillAbortError: If a step fails twice and patching is insufficient.
+        """
+        from .skill_router import route_skill
+
+        logger.info("=== run_from_webcam: capturing scene ===")
+        frame = await asyncio.get_event_loop().run_in_executor(
+            None, self._capture_frame
+        )
+        skill_name = route_skill(frame, self._vlm.verify)
+        logger.info("Webcam routed to skill: %s", skill_name)
+        return await self.run_skill(skill_name)
+
     # ------------------------------------------------------------------
     # Internal step execution
     # ------------------------------------------------------------------
@@ -350,6 +381,22 @@ class Orchestrator:
                 )
                 return False, patch_applied, last_latency_ms, failure_type
 
+            # --- Visual re-localisation (OBJECT_NOT_FOUND only) ---
+            # Before consulting the patch library, capture a fresh frame and
+            # ask the VLM where the object is. The returned deltas are applied
+            # on top of any param patch so the arm searches in the right area.
+            reloc_delta: dict = {}
+            if failure_type == OBJECT_NOT_FOUND:
+                reloc_delta = await self._relocalize_object()
+                if reloc_delta:
+                    current_params = self.patch_library.apply_to_params(
+                        current_params, reloc_delta
+                    )
+                    logger.info(
+                        "Step %d: relocalization delta applied: %s",
+                        step_id, reloc_delta,
+                    )
+
             # --- Apply patch and retry ---
             patch = self.patch_library.get_patch(skill_name, failure_type)
 
@@ -359,16 +406,20 @@ class Orchestrator:
                 action=action,
                 result="FAIL",
                 failure_type=failure_type,
-                patch_applied=patch,
+                patch_applied={**patch, **reloc_delta} if reloc_delta else patch,
                 gpu_latency_ms=latency_ms,
                 retry=is_retry,
             )
 
-            if patch:
-                current_params = self.patch_library.apply_to_params(current_params, patch)
-                self._robot.apply_patch(skill_name, patch)
+            if patch or reloc_delta:
+                if patch:
+                    current_params = self.patch_library.apply_to_params(current_params, patch)
+                    self._robot.apply_patch(skill_name, patch)
                 patch_applied = True
-                logger.info("Patch applied: %s — retrying step %d", patch, step_id)
+                logger.info(
+                    "Patch applied: %s (reloc: %s) — retrying step %d",
+                    patch, reloc_delta, step_id,
+                )
             else:
                 logger.warning("No patch available for %s — retrying without patch", failure_type)
 
@@ -391,6 +442,55 @@ class Orchestrator:
                 "Check that the USB webcam is connected and not in use by another process."
             )
         return frame
+
+    async def _relocalize_object(self) -> dict:
+        """
+        Run positional VLM queries to locate a lost/missing object and return
+        parameter deltas that shift the arm's approach toward it.
+
+        Called exclusively from the OBJECT_NOT_FOUND retry path.
+
+        Delegates to vlm_api.locate_object() which runs three yes/no queries
+        (visible? left? high?) and returns a hints dict.
+
+        Returns:
+            Parameter delta dict suitable for patch_library.apply_to_params(),
+            e.g. {"z_offset_mm": 10.0, "approach_angle_deg": -10.0}.
+            Returns {} if the object is not visible at all (hard abort on next
+            retry attempt is the right behaviour in that case).
+        """
+        frame = await asyncio.get_event_loop().run_in_executor(
+            None, self._capture_frame
+        )
+
+        # vlm_api.locate_object may not be present on older stub versions —
+        # fall back gracefully so the normal patch path still runs.
+        locate_fn = getattr(self._vlm, "locate_object", None)
+        if locate_fn is None:
+            logger.warning("_relocalize_object: vlm has no locate_object(), skipping")
+            return {}
+
+        hints = await asyncio.get_event_loop().run_in_executor(None, locate_fn, frame)
+        logger.info("Relocalization hints: %s", hints)
+
+        if not hints.get("visible", False):
+            logger.warning("Relocalization: object not visible — no delta applied")
+            return {}
+
+        delta: dict = {}
+        # Horizontal offset → adjust wrist approach angle
+        # left=True  → shift arm left  (negative angle)
+        # left=False → shift arm right (positive angle)
+        delta["approach_angle_deg"] = -10.0 if hints.get("left") else 10.0
+
+        # Vertical offset → adjust z approach
+        # high=True  → object is higher than expected, raise z
+        # high=False → object is lower, lower z
+        delta["z_offset_mm"] = 10.0 if hints.get("high") else -5.0
+
+        logger.info("Relocalization delta: %s (latency=%.0fms)",
+                    delta, hints.get("latency_ms", 0))
+        return delta
 
 
 # ---------------------------------------------------------------------------
