@@ -68,3 +68,30 @@ class TraceLogger:
 
     def clear(self) -> None:
         self.trace_file.unlink(missing_ok=True)
+
+
+# Module-level singleton + log_event() — called by orchestrator.py as trace_logger.log_event(...)
+_default_logger = TraceLogger()
+
+def log_event(
+    skill: str,
+    action: str,
+    result: str,
+    step_id: Optional[int] = None,
+    failure_type: Optional[str] = None,
+    patch_applied: Optional[dict] = None,
+    gpu_latency_ms: Optional[float] = None,  # orchestrator uses this name; stored as npu_latency_ms
+    retry: bool = False,
+) -> None:
+    # Normalise orchestrator's "patched_success" → "PATCHED" so dashboard colors it correctly
+    normalised = "PATCHED" if result == "patched_success" else result.upper() if result else result
+    _default_logger.log(TraceEvent(
+        skill=skill,
+        step_id=step_id if step_id is not None else -1,
+        action=action,
+        result=normalised,
+        npu_latency_ms=gpu_latency_ms,
+        failure_type=failure_type,
+        patch_applied=patch_applied,
+        retry=retry,
+    ))

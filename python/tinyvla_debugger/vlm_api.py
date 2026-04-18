@@ -134,7 +134,7 @@ def verify(frame, query: str) -> tuple[bool, float]:
         Returns (False, 0.0) on connection error so the orchestrator can
         classify the failure and retry rather than crashing.
     """
-    question = QUERIES.get(query, query)   # key → canned question, else literal
+    question = QUERIES.get(query, query)   # key → canned question, else use query as-is
     try:
         return _ask(frame, question)
     except Exception as exc:
@@ -165,6 +165,7 @@ def locate_object(frame) -> dict:
         hints["visible"] = visible
 
         if visible:
+            # Only ask positional questions if something is actually there
             left, ms = _ask(frame, "Is the object located on the left side of the scene?")
             total_latency += ms
             hints["left"] = left

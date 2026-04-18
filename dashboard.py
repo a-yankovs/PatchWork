@@ -35,10 +35,11 @@ CAMERA_INDICES = [0, 1]
 CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
 
 RESULT_COLOR = {
-    "PASS":    "#00D4AA",
-    "PATCHED": "#FF8C00",
-    "FAIL":    "#FF4444",
-    "ABORT":   "#FF0000",
+    "PASS":           "#00D4AA",
+    "PATCHED":        "#FF8C00",
+    "patched_success":"#FF8C00",  # orchestrator emits this before the shim normalises it
+    "FAIL":           "#FF4444",
+    "ABORT":          "#FF0000",
 }
 
 # the five phases of the ReAct agentic loop — shown in order across the UI
@@ -545,6 +546,7 @@ def live_dashboard() -> None:
 
         def _color(val: str) -> str:
             return {"PASS": "color: #00D4AA", "PATCHED": "color: #FF8C00",
+                    "patched_success": "color: #FF8C00",
                     "FAIL": "color: #FF4444", "ABORT": "color: #FF0000"}.get(val, "")
 
         st.dataframe(pd.DataFrame(rows).style.map(_color, subset=["Result"]),
