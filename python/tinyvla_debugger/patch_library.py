@@ -12,17 +12,21 @@ Storage format: patches.json, a flat JSON object keyed by
 
 Example patches.json:
 {
-  "stock_middle_shelf:GRASP_FAIL": {
-    "z_offset_mm": 5,
-    "applied_count": 3,
-    "last_applied": "2025-04-17T14:23:11"
+  "box_in_shelf:PLACEMENT_COLLISION": {
+    "speed_scale": 0.65,
+    "applied_count": 2,
+    "last_applied": "2026-04-18T16:00:38"
   },
-  "stock_middle_shelf:PLACEMENT_MISS": {
-    "approach_angle_deg": 10,
+  "pick_object:GRASP_FAIL": {
+    "speed_scale": 0.85,
     "applied_count": 1,
-    "last_applied": "2025-04-17T15:01:44"
+    "last_applied": "2026-04-18T16:01:04"
   }
 }
+
+Note: speed_scale is the only parameter that lerobot-replay physically
+honours (via --dataset.fps). All other parameters are tracked for
+observability but do not change the arm's motion in open-loop replay.
 
 Default patches are seeded on first encounter of a failure type.
 On a second consecutive failure with the same patch applied, the
@@ -49,14 +53,16 @@ logger = logging.getLogger(__name__)
 # The orchestrator handles this via apply_to_params — see _is_absolute.
 
 DEFAULT_PATCHES: dict[str, dict] = {
-    "GRASP_FAIL":          {"z_offset_mm": 5.0},
-    "PLACEMENT_MISS":      {"approach_angle_deg": 10.0},
-    "PLACEMENT_COLLISION": {"speed_scale": 0.7},        # absolute, not delta
-    "DROP_DURING_TRANSIT": {"gripper_close_force": 0.1},
-    # OBJECT_NOT_FOUND: conservative z raise as fallback if VLM re-localisation
-    # cannot pinpoint the object. The orchestrator applies positional deltas from
-    # locate_object() first; this patch is used only if that fails entirely.
-    "OBJECT_NOT_FOUND":    {"z_offset_mm": 8.0, "approach_angle_deg": 5.0},
+    # speed_scale is the only parameter that lerobot-replay actually accepts
+    # (maps to --dataset.fps=int(base_fps * speed_scale)).
+    # z_offset_mm / approach_angle_deg / gripper_close_force are tracked as
+    # metadata but NOT passed to lerobot — open-loop replay cannot modify the
+    # recorded trajectory. Only speed_scale changes the physical motion.
+    "GRASP_FAIL":          {"speed_scale": 0.85},       # slower close → better grip
+    "PLACEMENT_MISS":      {"speed_scale": 0.80},       # slower approach → more accurate placement
+    "PLACEMENT_COLLISION": {"speed_scale": 0.65},       # significantly slower → clear shelf edge
+    "DROP_DURING_TRANSIT": {"speed_scale": 0.75},       # slower transit → less inertia-induced drop
+    "OBJECT_NOT_FOUND":    {"speed_scale": 0.90},       # slight slow-down while searching
 }
 
 # Parameters whose patches are absolute values (replace, don't add)

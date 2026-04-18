@@ -295,7 +295,11 @@ class RobotAPI:
 
         for step in spec.steps:
             started_at = time.time()
-            self._replay_single_step(step.dataset_repo_id, episode=episode)
+            self._replay_single_step(
+                step.dataset_repo_id,
+                episode=episode,
+                speed_scale=merged_params.speed_scale,
+            )
             event = StepEvent(
                 skill_name=skill_name,
                 step_id=step.step_id,
@@ -420,7 +424,13 @@ class RobotAPI:
         ]
         self._run_command(cmd)
 
-    def _replay_single_step(self, dataset_repo_id: str, *, episode: int = 0) -> None:
+    def _replay_single_step(
+        self,
+        dataset_repo_id: str,
+        *,
+        episode: int = 0,
+        speed_scale: float = 1.0,
+    ) -> None:
         # dataset_repo_id is a local path like "./data/pick_object_v5".
         # LeRobot loads metadata from {root}/meta/info.json, so root must be
         # the dataset directory itself (not its parent):
@@ -447,7 +457,28 @@ class RobotAPI:
         ]
         if root is not None:
             cmd += [f"--dataset.root={root}"]
+
+        # speed_scale maps to lerobot's --dataset.fps override.
+        # The dataset's native fps is read from its meta/info.json; if that
+        # fails we fall back to 30. A lower fps slows the arm's motion —
+        # e.g. speed_scale=0.7 → fps=21 gives a 30% slower approach that
+        # helps avoid shelf-edge collisions.
+        if speed_scale != 1.0:
+            base_fps = self._get_dataset_fps(root or dataset_repo_id)
+            fps = max(1, int(base_fps * speed_scale))
+            cmd += [f"--dataset.fps={fps}"]
+
         self._run_command(cmd)
+
+    def _get_dataset_fps(self, root: str) -> int:
+        """Read the recorded fps from the dataset's meta/info.json."""
+        try:
+            meta_path = Path(root) / "meta" / "info.json"
+            with meta_path.open() as f:
+                meta = json.load(f)
+            return int(meta.get("fps", 30))
+        except Exception:
+            return 30
 
     def _run_command(self, cmd: List[str]) -> None:
         try:

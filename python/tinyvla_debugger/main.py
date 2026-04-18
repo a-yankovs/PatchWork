@@ -156,7 +156,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     )
     print(f"\n  • STT        → {stt_status}")
     print(f"  • SLM        → Phi-3-mini ({args.compiler})")
-    print(f"  • Webcam     → device {args.webcam}")
+    print(f"  • Webcam     → Overview/stationary (device 0) + Follower Side (device 2) — stitched")
     print("  • VLM        → Moondream2 via Ollama (localhost:11434)")
     print(f"  • Robot      → SO-100 follower ({args.robot_port}, id={args.robot_id})")
     print(f"  • Teleop     → SO-100 leader  ({args.teleop_port}, id={args.teleop_id})")
@@ -164,24 +164,51 @@ async def _main_async(args: argparse.Namespace) -> None:
     print("  • Audio      → ElevenLabs TTS (ELEVENLABS_API_KEY)")
 
     # ------------------------------------------------------------------
-    # Start webcam stream
+    # Start both camera streams and stitch into one frame for VLM.
+    #
+    # Dashboard layout:  0 = Follower Top (arm built-in), 2 = Follower Side (USB)
+    # The VLM receives a single horizontally-stitched image so it can reason
+    # about both the gripper state and the scene simultaneously.
+    # If one camera fails to open it is replaced with a grey placeholder so
+    # the other camera still reaches the VLM.
     # ------------------------------------------------------------------
-    cam = WebcamStream(index=args.webcam, mock=False)
-    try:
-        cam.start()
-    except RuntimeError as exc:
-        print(f"\n⚠  Webcam error: {exc}")
-        print("   Switching to synthetic blank frames.")
-        cam = WebcamStream(mock=True)
-        cam.start()
+    import numpy as np
+
+    _CAMERA_INDICES = [0, 2]
+    _CAMERA_LABELS  = ["Overview (stationary)", "Follower Side"]
+
+    cams: list[WebcamStream] = []
+    for idx, label in zip(_CAMERA_INDICES, _CAMERA_LABELS):
+        c = WebcamStream(index=idx, mock=False)
+        try:
+            c.start()
+            print(f"   ✓ {label} (device {idx}) opened")
+        except RuntimeError as exc:
+            print(f"   ⚠  {label} (device {idx}) failed: {exc} — using blank placeholder")
+            c = WebcamStream(mock=True)   # grey fallback
+            c.start()
+        cams.append(c)
+
+    def _stitched_frame() -> "np.ndarray":
+        """Return both camera frames side by side as one image for VLM."""
+        frames = []
+        for c in cams:
+            try:
+                frames.append(c.get_latest_frame())
+            except RuntimeError:
+                frames.append(np.full((480, 640, 3), 80, dtype=np.uint8))
+        # Resize both to the same height before hstack
+        h = min(f.shape[0] for f in frames)
+        resized = [f[:h, :] for f in frames]
+        return np.hstack(resized)
 
     try:
         # ------------------------------------------------------------------
-        # Build orchestrator — frame_source wires in the streaming webcam
+        # Build orchestrator — frame_source delivers the stitched dual-cam frame
         # ------------------------------------------------------------------
         orc = _build_orchestrator(
-            webcam_index=args.webcam,
-            frame_source=cam.get_latest_frame,
+            webcam_index=_CAMERA_INDICES[1],   # kept for fallback inside orchestrator
+            frame_source=_stitched_frame,
             compiler_backend=args.compiler,
             robot_port=args.robot_port,
             teleop_port=args.teleop_port,
@@ -230,7 +257,8 @@ async def _main_async(args: argparse.Namespace) -> None:
             sys.exit(0 if success else 1)
 
     finally:
-        cam.stop()
+        for c in cams:
+            c.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +278,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Skip STT; use this text command directly",
     )
 
-    # --- Hardware: webcam + compiler ---
-    parser.add_argument(
-        "--webcam", type=int, default=0, metavar="N",
-        help="OpenCV webcam device index (default: 0; external AMD USB webcam is 2)",
-    )
+    # --- Hardware: compiler ---
+    # Cameras are always opened at indices 0 (Follower Top) and 2 (Follower Side)
+    # to match the dashboard. No --webcam flag needed.
     parser.add_argument(
         "--compiler", default="auto",
         choices=["auto", "llama_cpp", "onnx_rocm", "mock"],

@@ -30,9 +30,9 @@ SKILL_STEPS = [
     {"step_id": 4, "action": "check_box_empty", "label": "Check Done"},
 ]
 
-# Index 0 = laptop built-in cam, index 2 = external USB webcam. Index 1 unavailable.
+# Index 0 = stationary overview USB webcam, index 2 = follower side USB webcam.
 CAMERA_INDICES = [0, 2]
-CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
+CAMERA_LABELS  = ["Overview (stationary)", "Follower — Side"]
 
 RESULT_COLOR = {
     "PASS":    "#00D4AA",

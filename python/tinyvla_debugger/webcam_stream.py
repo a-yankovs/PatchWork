@@ -25,6 +25,7 @@ Mock mode (no webcam required — for testing):
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Callable, Optional
@@ -87,23 +88,30 @@ class WebcamStream:
             return self
 
         # [REAL] Open physical camera via OpenCV VideoCapture.
-        self._cap = cv2.VideoCapture(self.index)
+        # Suppress V4L2 "can't open camera by index" warnings that OpenCV
+        # prints to stderr even before isOpened() returns False — they are
+        # expected when device 0 has a permissions issue and we handle it below.
+        os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+        self._cap = cv2.VideoCapture(self.index, cv2.CAP_V4L2)
         if not self._cap.isOpened():
+            self._cap.release()
             raise RuntimeError(
-                f"WebcamStream: cannot open camera at index {self.index}. "
-                "Check that the USB webcam is plugged in and not in use by another process."
+                f"WebcamStream: cannot open camera at index {self.index} via V4L2. "
+                "Check the webcam is plugged in and not in use by another process."
             )
 
         # Request resolution (driver may ignore)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
 
-        # Grab one warm-up frame synchronously so get_latest_frame() returns
-        # immediately on the first call
-        ret, frame = self._cap.read()
-        if ret:
-            self._frame = frame
-            logger.debug("WebcamStream: warm-up frame captured")
+        # Flush a few warm-up frames so the background thread starts from
+        # a valid frame rather than whatever stale buffer the driver has.
+        for _ in range(5):
+            ret, frame = self._cap.read()
+            if ret:
+                self._frame = frame
+        if self._frame is not None:
+            logger.debug("WebcamStream: warm-up frames flushed (device %d)", self.index)
 
         self._running = True
         self._thread = threading.Thread(
