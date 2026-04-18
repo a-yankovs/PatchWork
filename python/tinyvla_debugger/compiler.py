@@ -3,7 +3,7 @@ compiler.py — Natural language → skill program JSON compiler
 Owner: Vera
 
 Runs Phi-3-mini-4k-instruct (Microsoft's on-device SLM) on the AMD
-Ryzen AI GPU via llama-cpp-python or ONNX Runtime DirectML.
+ROCm GPU via llama-cpp-python or ONNX Runtime ROCm execution provider.
 
 Usage:
     compiler = SkillCompiler()                     # auto-detects backend
@@ -12,9 +12,13 @@ Usage:
     # skill is a dict matching SKILL_PROGRAM_SCHEMA
 
 Backends (tried in order if backend="auto"):
-    1. llama_cpp   — llama-cpp-python with Phi-3 GGUF model
-    2. onnx_dml    — ONNX Runtime DirectML (AMD GPU)
+    1. llama_cpp   — llama-cpp-python with Phi-3 GGUF model (ROCm via HIP)
+    2. onnx_rocm   — ONNX Runtime ROCMExecutionProvider (AMD ROCm GPU)
     3. mock        — Returns deterministic test fixture (never in production)
+
+Install notes:
+    llama_cpp:  CMAKE_ARGS="-DGGML_HIPBLAS=on" pip install llama-cpp-python
+    onnx_rocm:  pip install onnxruntime-rocm --break-system-packages
 """
 
 from __future__ import annotations
@@ -139,7 +143,7 @@ _DEFAULT_ONNX_PATH = os.environ.get(
     "models/phi-3-mini-4k-instruct-onnx",
 )
 
-BackendType = Literal["auto", "llama_cpp", "onnx_dml", "mock"]
+BackendType = Literal["auto", "llama_cpp", "onnx_rocm", "mock"]
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +155,11 @@ class SkillCompiler:
     Compiles natural language shelf commands into structured skill programs.
 
     Args:
-        backend:    "auto" tries llama_cpp → onnx_dml → mock.
+        backend:    "auto" tries llama_cpp → onnx_rocm → mock.
                     Force a specific backend for testing or when you know
                     what's available.
         model_path: Path to GGUF model (llama_cpp backend) or ONNX model
-                    directory (onnx_dml backend).
+                    directory (onnx_rocm backend).
         temperature: Sampling temperature. Keep at 0.0 for deterministic output.
     """
 
@@ -220,19 +224,19 @@ class SkillCompiler:
                     "or model not found. Run: pip install llama-cpp-python"
                 )
 
-        if backend in ("onnx_dml", "auto"):
-            result = self._try_onnx_dml(model_path)
+        if backend in ("onnx_rocm", "auto"):
+            result = self._try_onnx_rocm(model_path)
             if result is not None:
-                return "onnx_dml", result
-            if backend == "onnx_dml":
+                return "onnx_rocm", result
+            if backend == "onnx_rocm":
                 raise RuntimeError(
-                    "onnx_dml backend requested but onnxruntime-directml is not installed "
-                    "or model not found."
+                    "onnx_rocm backend requested but onnxruntime-rocm is not installed "
+                    "or model not found. Run: pip install onnxruntime-rocm"
                 )
 
         # auto fell through — use mock with a clear warning
         logger.warning(
-            "No GPU backend available (llama_cpp or onnx_dml). "
+            "No GPU backend available (llama_cpp or onnx_rocm). "
             "Falling back to MOCK compiler — output is deterministic test data, "
             "not real Phi-3 inference. Set PHI3_GGUF_PATH or install llama-cpp-python."
         )
@@ -254,7 +258,7 @@ class SkillCompiler:
         llm = Llama(
             model_path=path,
             n_ctx=4096,
-            n_gpu_layers=-1,   # offload all layers to GPU
+            n_gpu_layers=-1,   # offload all layers to ROCm GPU (HIP backend)
             verbose=False,
         )
 
@@ -272,7 +276,7 @@ class SkillCompiler:
 
         return engine
 
-    def _try_onnx_dml(self, model_path: str | None):
+    def _try_onnx_rocm(self, model_path: str | None):
         try:
             import onnxruntime as ort  # type: ignore
             from transformers import AutoTokenizer  # type: ignore
@@ -286,15 +290,15 @@ class SkillCompiler:
             return None
 
         providers = ort.get_available_providers()
-        if "DmlExecutionProvider" not in providers:
-            logger.debug("DmlExecutionProvider not available, providers: %s", providers)
+        if "ROCMExecutionProvider" not in providers:
+            logger.debug("ROCMExecutionProvider not available, providers: %s", providers)
             return None
 
-        logger.info("Loading Phi-3 via ONNX DirectML from %s", path)
+        logger.info("Loading Phi-3 via ONNX ROCm from %s", path)
         tokenizer = AutoTokenizer.from_pretrained(path)
         session = ort.InferenceSession(
             str(Path(path) / "model.onnx"),
-            providers=["DmlExecutionProvider"],
+            providers=["ROCMExecutionProvider"],
         )
 
         def engine(nl_command: str) -> str:
@@ -324,6 +328,10 @@ class SkillCompiler:
         """
         Returns a deterministic skill program based on keywords in the command.
         NOT Phi-3 inference — for development and CI only.
+
+        TODO: HARDWARE — this entire method is mock data. In production the
+        llama_cpp or onnx_rocm engine is used instead (see _init_backend).
+        This only runs when neither backend is available or backend="mock".
         """
         cmd = nl_command.lower()
 
@@ -445,7 +453,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="SkillPatch NL compiler")
     parser.add_argument("command", nargs="?", default="Put the canned goods on the middle shelf")
-    parser.add_argument("--backend", default="auto", choices=["auto", "llama_cpp", "onnx_dml", "mock"])
+    parser.add_argument("--backend", default="auto", choices=["auto", "llama_cpp", "onnx_rocm", "mock"])
     parser.add_argument("--model-path", default=None)
     args = parser.parse_args()
 

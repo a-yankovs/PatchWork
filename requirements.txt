@@ -1,10 +1,13 @@
 # SkillPatch — Python dependencies
 # Install: pip install -r requirements.txt
 #
-# Hardware-specific packages (AMD Ryzen AI):
-#   llama-cpp-python    — requires cmake + C++ compiler; GPU build needs ROCm
-#   onnxruntime-directml — AMD GPU (DirectML); Windows only
-#   onnxruntime-qnn      — AMD NPU (QNN); requires AMD AI SDK
+# Hardware-specific packages (AMD ROCm GPU):
+#   llama-cpp-python    — requires cmake + C++ compiler; GPU build needs ROCm HIP
+#   onnxruntime-rocm    — AMD ROCm GPU (Linux); pip install onnxruntime-rocm
+#
+# Audio playback (Linux node):
+#   sudo apt-get install -y mpg123   (preferred, lowest latency)
+#   or: ffmpeg (provides ffplay)
 
 # --- Core orchestration (Vera) ---
 # opencv for webcam capture in orchestrator
@@ -18,17 +21,20 @@ numpy>=1.24.0
 #   pip install llama-cpp-python                                     (CPU fallback)
 llama-cpp-python>=0.2.0
 
-# Option B: ONNX Runtime + HuggingFace tokenizer (DirectML / AMD GPU on Windows)
+# Option B: ONNX Runtime + HuggingFace tokenizer (ROCm / AMD GPU on Linux)
 # Uncomment if using ONNX backend:
-# onnxruntime-directml>=1.17.0
+# onnxruntime-rocm>=1.17.0
 # transformers>=4.40.0
 # tokenizers>=0.19.0
 
 # --- VLM verifier backend (Sasha) ---
-# Install AMD AI SDK first, then the appropriate onnxruntime variant.
 # Uncomment one:
 # onnxruntime>=1.17.0              # CPU baseline
-# onnxruntime-directml>=1.17.0     # AMD GPU fallback
+# onnxruntime-rocm>=1.17.0         # AMD ROCm GPU (primary)
+
+# --- Audio feedback / TTS (Vera) ---
+# Requires ELEVENLABS_API_KEY env var; silently mocks if not set.
+elevenlabs>=1.0.0
 
 # --- Robot hardware (Diya) ---
 # Install from source:

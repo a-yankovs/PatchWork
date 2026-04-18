@@ -17,7 +17,7 @@ trace.jsonl schema (one JSON object per line):
                                    # "abort" | "running" | "skill_complete"
     "failure_type":  str | null,   # e.g. "GRASP_FAIL" or null
     "patch_applied": dict | null,  # e.g. {"z_offset_mm": 5} or null
-    "npu_latency_ms":float | null, # VLM inference latency in ms
+    "gpu_latency_ms":float | null, # VLM inference latency in ms (ROCm GPU)
     "retry":         bool          # True if this is a retry attempt
   }
 """
@@ -41,7 +41,7 @@ def log_event(
     step_id: Optional[int] = None,
     failure_type: Optional[str] = None,
     patch_applied: Optional[dict] = None,
-    npu_latency_ms: Optional[float] = None,
+    gpu_latency_ms: Optional[float] = None,
     retry: bool = False,
     timestamp: Optional[float] = None,
     trace_file: Optional[Path] = None,
@@ -57,7 +57,7 @@ def log_event(
         step_id:        Step index (0-based). None for skill-level events.
         failure_type:   Failure class from classifier, or None.
         patch_applied:  Parameter delta dict that was applied, or None.
-        npu_latency_ms: VLM inference latency in milliseconds, or None.
+        gpu_latency_ms: VLM inference latency in milliseconds (ROCm GPU), or None.
         retry:          True if this event is a retry attempt.
         timestamp:      Unix timestamp; defaults to time.time().
         trace_file:     Override default TRACE_FILE path (useful in tests).
@@ -70,7 +70,7 @@ def log_event(
         "result": result,
         "failure_type": failure_type,
         "patch_applied": patch_applied,
-        "npu_latency_ms": round(npu_latency_ms, 2) if npu_latency_ms is not None else None,
+        "gpu_latency_ms": round(gpu_latency_ms, 2) if gpu_latency_ms is not None else None,
         "retry": retry,
     }
 

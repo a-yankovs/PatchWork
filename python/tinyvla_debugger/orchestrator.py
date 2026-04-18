@@ -46,6 +46,7 @@ from typing import Any, Iterator, Optional, Protocol
 
 import cv2  # webcam capture — pip install opencv-python-headless
 
+from .audio_feedback import AudioFeedback
 from .classifier import FailureClassifier
 from .compiler import SkillCompiler
 from .patch_library import PatchLibrary
@@ -98,7 +99,7 @@ class SkillResult:
     outcome: str               # "success" | "aborted"
     steps_executed: int = 0
     steps_patched: int = 0
-    total_npu_ms: float = 0.0
+    total_gpu_ms: float = 0.0
     failure_type: Optional[str] = None
     error: Optional[str] = None
 
@@ -115,9 +116,9 @@ class Orchestrator:
         robot:            RobotAPI implementation. Defaults to importing
                           robot_api module (real hardware).
         vlm:              VLM verifier implementation. Defaults to importing
-                          vlm_api module (real NPU inference).
+                          vlm_api module (real ROCm GPU inference).
         compiler_backend: Passed to SkillCompiler — "auto", "llama_cpp",
-                          "onnx_dml", or "mock".
+                          "onnx_rocm", or "mock".
         patches_file:     Path to patches.json.
         trace_file:       Path to trace.jsonl.
         webcam_index:     OpenCV webcam device index (default 0).
@@ -131,6 +132,7 @@ class Orchestrator:
         patches_file: Optional[str] = None,
         trace_file: Optional[str] = None,
         webcam_index: int = 0,
+        audio: Optional[AudioFeedback] = None,
     ) -> None:
         # Layer 1
         self.compiler = SkillCompiler(backend=compiler_backend)
@@ -159,6 +161,10 @@ class Orchestrator:
             trace_logger.TRACE_FILE = Path(trace_file)
 
         self._webcam_index = webcam_index
+
+        # Layer 7 — audio feedback (ElevenLabs TTS)
+        # Reads ELEVENLABS_API_KEY from env automatically; silently mocks if not set.
+        self._audio = audio if audio is not None else AudioFeedback()
 
     # ------------------------------------------------------------------
     # Public
@@ -215,12 +221,15 @@ class Orchestrator:
             if patch_was_applied:
                 result.steps_patched += 1
             if latency_ms:
-                result.total_npu_ms += latency_ms
+                result.total_gpu_ms += latency_ms
 
             if not step_passed:
                 # _execute_step_with_retry already logged the abort event
                 result.outcome      = "aborted"
                 result.failure_type = failure_type
+                self._audio.speak_error(
+                    failure_type or "UNKNOWN_FAIL", step_id, skill_name
+                )
                 raise SkillAbortError(failure_type or "UNKNOWN_FAIL", step_id, skill_name)
 
         # --- Skill complete ---
@@ -231,8 +240,11 @@ class Orchestrator:
             step_id=None,
             failure_type=None,
             patch_applied=None,
-            npu_latency_ms=None,
+            gpu_latency_ms=None,
             retry=False,
+        )
+        self._audio.speak_success(
+            skill_name, result.steps_executed, result.steps_patched
         )
         logger.info("=== Skill complete: %s (%d steps, %d patched) ===",
                     skill_name, result.steps_executed, result.steps_patched)
@@ -254,7 +266,7 @@ class Orchestrator:
         Execute one step with up to MAX_RETRIES_PER_STEP attempts.
 
         Returns:
-            (passed, patch_was_applied, last_npu_latency_ms, failure_type)
+            (passed, patch_was_applied, last_gpu_latency_ms, failure_type)
         """
         patch_applied    = False
         last_latency_ms  = None
@@ -276,7 +288,7 @@ class Orchestrator:
                 step_id=step_id,
                 action=action,
                 result="running",
-                npu_latency_ms=None,
+                gpu_latency_ms=None,
                 retry=is_retry,
             )
 
@@ -294,11 +306,14 @@ class Orchestrator:
                     step_id=step_id,
                     action=action,
                     result=outcome,
-                    npu_latency_ms=latency_ms,
+                    gpu_latency_ms=latency_ms,
                     patch_applied=self.patch_library.get_patch(skill_name, failure_type)
                         if patch_applied and failure_type else None,
                     retry=is_retry,
                 )
+
+                if patch_applied and failure_type:
+                    self._audio.speak_patch_success(failure_type, step_id)
 
                 if patch_applied and failure_type:
                     # Store the patch that worked
@@ -330,7 +345,7 @@ class Orchestrator:
                     result="abort",
                     failure_type=failure_type,
                     patch_applied=None,
-                    npu_latency_ms=latency_ms,
+                    gpu_latency_ms=latency_ms,
                     retry=is_retry,
                 )
                 return False, patch_applied, last_latency_ms, failure_type
@@ -345,7 +360,7 @@ class Orchestrator:
                 result="FAIL",
                 failure_type=failure_type,
                 patch_applied=patch,
-                npu_latency_ms=latency_ms,
+                gpu_latency_ms=latency_ms,
                 retry=is_retry,
             )
 
@@ -386,6 +401,9 @@ class MockRobotAPI:
     """
     Mock robot_api for testing orchestration logic without hardware.
 
+    TODO: HARDWARE — replace with real robot_api (Diya) when available.
+    Swap by passing robot_api module directly to Orchestrator(robot=...).
+
     Args:
         failure_on_step: Step ID that should "fail" (gripper doesn't close).
                          Set to -1 for no failures.
@@ -401,10 +419,13 @@ class MockRobotAPI:
     def replay_skill(self, skill_name: str, params: dict) -> Iterator[Any]:
         from .robot_api import StepEvent
         for i in range(self.num_steps):
+            # TODO: HARDWARE — gripper_state is simulated here.
+            # Real robot_api.replay_skill() yields actual StepEvents from
+            # the SO-100 arm with live gripper sensor readings.
             gripper = "open" if i == self.failure_on_step else "closed"
             yield StepEvent(
                 step_id=i,
-                action=f"mock_action_{i}",
+                action=f"mock_action_{i}",        # TODO: HARDWARE — real action name from robot
                 timestamp=time.time(),
                 gripper_state=gripper,
                 params_used=dict(params),
@@ -420,7 +441,10 @@ class MockRobotAPI:
 
 class MockVLMAPI:
     """
-    Mock vlm_api for testing orchestration logic without NPU.
+    Mock vlm_api for testing orchestration logic without ROCm GPU.
+
+    TODO: HARDWARE — replace with real vlm_api (Sasha) when available.
+    Swap by passing vlm_api module directly to Orchestrator(vlm=...).
 
     Args:
         fail_step_ids:   Set of step_ids whose verify() call returns False
@@ -431,7 +455,8 @@ class MockVLMAPI:
     def __init__(
         self,
         fail_step_ids: set[int] | None = None,
-        latency_ms: float = 95.0,
+        latency_ms: float = 95.0,       # TODO: HARDWARE — hardcoded simulated latency;
+                                         # real vlm_api returns measured ROCm inference time
     ) -> None:
         self.fail_step_ids = fail_step_ids or set()
         self.latency_ms = latency_ms
@@ -445,8 +470,12 @@ class MockVLMAPI:
 
         if step_id in self.fail_step_ids and count == 0:
             logger.debug("MockVLMAPI.verify — returning False (step %d, attempt 1)", step_id)
+            # TODO: HARDWARE — False here is simulated failure for testing patch path.
+            # Real vlm_api.verify() calls Moondream2 on ROCm GPU against the live frame.
             return False, self.latency_ms
 
+        # TODO: HARDWARE — True here is simulated success.
+        # Real vlm_api.verify() returns actual model inference result + measured ms.
         return True, self.latency_ms
 
 
@@ -470,7 +499,7 @@ async def _main(command: str, mock: bool = False) -> None:
         print(f"✓ Skill complete: {result.skill_name}")
         print(f"  Steps executed : {result.steps_executed}")
         print(f"  Steps patched  : {result.steps_patched}")
-        print(f"  Total NPU time : {result.total_npu_ms:.1f}ms")
+        print(f"  Total GPU time : {result.total_gpu_ms:.1f}ms")
     except SkillAbortError as e:
         print(f"✗ Skill aborted: {e}")
 
