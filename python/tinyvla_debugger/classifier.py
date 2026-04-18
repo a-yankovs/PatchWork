@@ -34,6 +34,7 @@ GRASP_FAIL          = "GRASP_FAIL"
 PLACEMENT_MISS      = "PLACEMENT_MISS"
 PLACEMENT_COLLISION = "PLACEMENT_COLLISION"
 DROP_DURING_TRANSIT = "DROP_DURING_TRANSIT"
+OBJECT_NOT_FOUND    = "OBJECT_NOT_FOUND"   # object absent / outside reach before pick
 UNKNOWN_FAIL        = "UNKNOWN_FAIL"
 
 ALL_FAILURE_TYPES = {
@@ -41,6 +42,7 @@ ALL_FAILURE_TYPES = {
     PLACEMENT_MISS,
     PLACEMENT_COLLISION,
     DROP_DURING_TRANSIT,
+    OBJECT_NOT_FOUND,
     UNKNOWN_FAIL,
 }
 
@@ -48,10 +50,11 @@ ALL_FAILURE_TYPES = {
 # Action groups
 # ---------------------------------------------------------------------------
 
-PICK_ACTIONS   = {"pick_from_box", "pick"}
-PLACE_ACTIONS  = {"place_slot_1", "place_slot_2", "place_slot_3", "place"}
-SCAN_ACTIONS   = {"scan_shelf", "scan"}
+PICK_ACTIONS   = {"pick_from_box", "pick", "pick_object"}
+PLACE_ACTIONS  = {"place_slot_1", "place_slot_2", "place_slot_3", "place", "place_in_box"}
+SCAN_ACTIONS   = {"scan_shelf", "scan", "scan_scene"}
 CHECK_ACTIONS  = {"check_box_empty", "check_empty"}
+MOVE_ACTIONS   = {"move_box_to_shelf"}
 
 # ---------------------------------------------------------------------------
 # Query fingerprints (substrings to match, all lowercase)
@@ -83,6 +86,17 @@ _EMPTY_PATTERNS = [
     "is slot",
 ]
 
+_OBJECT_VISIBLE_PATTERNS = [
+    "object visible",
+    "object in the pick zone",
+    "object present",
+    "item visible",
+    "something to pick",
+    "visible in the pick zone",
+    "visible in the scene",
+    "an object visible",
+]
+
 
 def _matches_any(text: str, patterns: list[str]) -> bool:
     t = text.lower()
@@ -109,6 +123,8 @@ class FailureClassifier:
     Classifies robot execution failures from VLM query results.
 
     Decision tree (per spec table):
+      0. Query mentions object/item visibility AND result is False on a
+         scan or pick action → OBJECT_NOT_FOUND (triggers visual re-localisation)
       1. Query mentions gripper/holding → GRASP_FAIL
       2. Query mentions item upright/placement:
            first attempt  → PLACEMENT_MISS
@@ -188,6 +204,26 @@ class FailureClassifier:
         retry: bool,
         expected: bool,
     ) -> ClassificationResult:
+
+        # Rule 0 — Object not found (must come before Rule 1)
+        # Triggered when: visibility/scene query returns False on a scan or pick action.
+        # The object was absent before the arm even attempted to grasp.
+        # → orchestrator will run visual re-localisation, then retry.
+        if (
+            _matches_any(query, _OBJECT_VISIBLE_PATTERNS)
+            and result is False
+            and action in (SCAN_ACTIONS | PICK_ACTIONS)
+        ):
+            return ClassificationResult(
+                failure_type=OBJECT_NOT_FOUND,
+                confidence="high",
+                reasoning=(
+                    f"VLM query '{query}' returned False during "
+                    f"{'scan' if action in SCAN_ACTIONS else 'pick'} action — "
+                    "object not visible in pick zone. "
+                    "Orchestrator will run visual re-localisation before retry."
+                ),
+            )
 
         # Rule 1 — Grasp failure
         # Triggered when: gripper-check query returns False (object not in gripper)

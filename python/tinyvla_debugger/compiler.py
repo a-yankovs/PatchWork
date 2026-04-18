@@ -36,14 +36,30 @@ logger = logging.getLogger(__name__)
 # Schema
 # ---------------------------------------------------------------------------
 
+# All valid action names — original shelf-stocking primitives + new robot API skills.
+# Diya's robot_api.replay_skill() must handle all of these.
+VALID_ACTIONS = {
+    # Original shelf-stocking primitives
+    "scan_shelf",
+    "pick_from_box",
+    "place_slot_1",
+    "place_slot_2",
+    "place_slot_3",
+    "check_box_empty",
+    # New robot API skill primitives (robot_api.py — Diya)
+    "scan_scene",      # general workspace scan: locate objects in view
+    "pick_object",     # pick an object from arbitrary scene position (not from box)
+    "place_in_box",    # place held object into a box
+    "move_box_to_shelf",  # grasp a box and set it onto the shelf
+}
+
 SKILL_PROGRAM_SCHEMA = {
     "skill_name": "string (snake_case identifier)",
     "description": "string",
     "steps": [
         {
             "step_id": "int (0-indexed)",
-            "action": "string — one of: scan_shelf, pick_from_box, place_slot_1, "
-                      "place_slot_2, place_slot_3, check_box_empty",
+            "action": f"string — one of: {', '.join(sorted(VALID_ACTIONS))}",
             "verification_query": "string — yes/no question about the scene",
             "expected_result": "bool",
         }
@@ -54,6 +70,113 @@ SKILL_PROGRAM_SCHEMA = {
         "approach_angle_deg": "float — wrist approach rotation in degrees, default 0",
         "gripper_close_force": "float — grip strength 0.0–1.0, default 0.6",
         "retry_count": "int — max automatic retries per step, default 2",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Static skill registry — the four canonical robot skills
+#
+# These are returned directly by compile() without invoking the LLM.
+# Use these exact skill_name strings when calling run_skill() or
+# run_from_webcam(). Diya must record LeRobot trajectories under these names.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PARAMS = {
+    "z_offset_mm": 0.0,
+    "speed_scale": 1.0,
+    "approach_angle_deg": 0.0,
+    "gripper_close_force": 0.6,
+    "retry_count": 2,
+}
+
+SKILL_REGISTRY: dict[str, dict] = {
+    "pick_object": {
+        "skill_name": "pick_object",
+        "description": "Locate and pick an object from the scene into the gripper.",
+        "steps": [
+            {
+                "step_id": 0,
+                "action": "scan_scene",
+                "verification_query": "Is there an object visible in the pick zone?",
+                "expected_result": True,
+            },
+            {
+                "step_id": 1,
+                "action": "pick_object",
+                "verification_query": "Is an object held securely in the gripper?",
+                "expected_result": True,
+            },
+        ],
+        "parameters": dict(_DEFAULT_PARAMS),
+    },
+    "place_in_box": {
+        "skill_name": "place_in_box",
+        "description": "Place the object currently held in the gripper into the target box.",
+        "steps": [
+            {
+                "step_id": 0,
+                "action": "place_in_box",
+                "verification_query": "Is the object now placed inside the box?",
+                "expected_result": True,
+            },
+            {
+                "step_id": 1,
+                "action": "check_box_empty",
+                "verification_query": "Is the box still empty?",
+                "expected_result": False,   # box should NOT be empty after placement
+            },
+        ],
+        "parameters": dict(_DEFAULT_PARAMS),
+    },
+    "full_pick_and_place": {
+        "skill_name": "full_pick_and_place",
+        "description": "Pick an object from the scene and place it into the target box.",
+        "steps": [
+            {
+                "step_id": 0,
+                "action": "scan_scene",
+                "verification_query": "Is there an object visible in the pick zone?",
+                "expected_result": True,
+            },
+            {
+                "step_id": 1,
+                "action": "pick_object",
+                "verification_query": "Is an object held securely in the gripper?",
+                "expected_result": True,
+            },
+            {
+                "step_id": 2,
+                "action": "place_in_box",
+                "verification_query": "Is the object now placed inside the box?",
+                "expected_result": True,
+            },
+        ],
+        "parameters": dict(_DEFAULT_PARAMS),
+    },
+    "box_in_shelf": {
+        "skill_name": "box_in_shelf",
+        "description": "Pick up a box and place it upright in an empty shelf slot.",
+        "steps": [
+            {
+                "step_id": 0,
+                "action": "scan_shelf",
+                "verification_query": "Is there an empty slot visible on the shelf?",
+                "expected_result": True,
+            },
+            {
+                "step_id": 1,
+                "action": "pick_object",
+                "verification_query": "Is a box held securely in the gripper?",
+                "expected_result": True,
+            },
+            {
+                "step_id": 2,
+                "action": "move_box_to_shelf",
+                "verification_query": "Is a box standing upright in the shelf slot?",
+                "expected_result": True,
+            },
+        ],
+        "parameters": dict(_DEFAULT_PARAMS),
     },
 }
 
@@ -72,7 +195,7 @@ OUTPUT SCHEMA — your response must be a single JSON object matching this exact
   "steps": [
     {
       "step_id": <int, 0-indexed>,
-      "action": "<one of: scan_shelf | pick_from_box | place_slot_1 | place_slot_2 | place_slot_3 | check_box_empty>",
+      "action": "<one of: scan_shelf | scan_scene | pick_from_box | pick_object | place_slot_1 | place_slot_2 | place_slot_3 | place_in_box | move_box_to_shelf | check_box_empty>",
       "verification_query": "<yes/no question the VLM will check after this step>",
       "expected_result": <true | false>
     }
@@ -181,9 +304,14 @@ class SkillCompiler:
         """
         Compile a natural language command into a skill program.
 
+        If nl_command exactly matches a key in SKILL_REGISTRY (case-insensitive,
+        underscores/spaces normalised), the static program is returned immediately
+        without invoking the LLM. This is the fast path used by run_from_webcam().
+
         Args:
             nl_command: Free-form shelf stocking instruction, e.g.
-                        "Put the soup cans on the middle shelf".
+                        "Put the soup cans on the middle shelf",
+                        OR a canonical skill name, e.g. "pick_object".
 
         Returns:
             Skill program dict matching SKILL_PROGRAM_SCHEMA.
@@ -192,8 +320,17 @@ class SkillCompiler:
             ValueError: If the model output cannot be parsed as valid JSON
                         matching the schema after two attempts.
         """
-        logger.info("Compiling: %r", nl_command)
+        # --- Registry fast path ---
+        normalised = nl_command.strip().lower().replace(" ", "_")
+        if normalised in SKILL_REGISTRY:
+            skill = SKILL_REGISTRY[normalised]
+            logger.info(
+                "Registry hit for %r → %s (%d steps)",
+                nl_command, skill["skill_name"], len(skill["steps"]),
+            )
+            return skill
 
+        logger.info("Compiling via LLM: %r", nl_command)
         raw = self._engine(nl_command)
         skill = self._parse_and_validate(raw)
 
