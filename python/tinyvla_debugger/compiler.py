@@ -160,14 +160,15 @@ class SkillCompiler:
                     what's available.
         model_path: Path to GGUF model (llama_cpp backend) or ONNX model
                     directory (onnx_rocm backend).
-        temperature: Sampling temperature. Keep at 0.0 for deterministic output.
+        temperature: Sampling temperature. 0.1 recommended — 0.0 (greedy) causes
+                     degenerate empty output with long prompts on some GGUF builds.
     """
 
     def __init__(
         self,
         backend: BackendType = "auto",
         model_path: str | None = None,
-        temperature: float = 0.0,
+        temperature: float = 0.1,
     ) -> None:
         self.temperature = temperature
         self._backend, self._engine = self._init_backend(backend, model_path)
@@ -263,16 +264,32 @@ class SkillCompiler:
         )
 
         def engine(nl_command: str) -> str:
-            response = llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": nl_command},
-                ],
-                temperature=self.temperature,
-                max_tokens=1024,
-                response_format={"type": "json_object"},
+            # Raw completion with Phi-3 chat template built manually.
+            # - No manual <s>: llama_cpp adds BOS automatically; including it
+            #   in the string causes a duplicate BOS and degrades output quality.
+            # - Assistant turn primed with "{" forces the model to start the JSON
+            #   object immediately rather than generating preamble.
+            # - temperature=0.0 (greedy) causes degenerate empty {} output with
+            #   long prompts; 0.1 adds just enough variance to escape it.
+            # - Text-level stops ("CANONICAL", "\nNote", "\nExample") catch
+            #   Phi-3's tendency to repeat the system prompt after the JSON closes.
+            prompt = (
+                f"<|system|>\n{_SYSTEM_PROMPT}<|end|>\n"
+                f"<|user|>\n{nl_command}<|end|>\n"
+                f"<|assistant|>\n{{"
             )
-            return response["choices"][0]["message"]["content"]
+            response = llm(
+                prompt,
+                temperature=max(self.temperature, 0.1),  # never go below 0.1
+                max_tokens=1024,
+                stop=[
+                    "<|end|>", "<|user|>", "<|system|>", "<|endoftext|>",
+                    "\nCANONICAL", "\nNote:", "\nExample",  # catch system-prompt bleed
+                ],
+                echo=False,
+            )
+            # Prepend the { we used to prime the assistant turn
+            return "{" + response["choices"][0]["text"]
 
         return engine
 
@@ -320,77 +337,77 @@ class SkillCompiler:
 
         return engine
 
-    # ------------------------------------------------------------------
-    # Mock engine (testing without hardware)
-    # ------------------------------------------------------------------
+    # # ------------------------------------------------------------------
+    # # Mock engine (testing without hardware)
+    # # ------------------------------------------------------------------
 
-    def _mock_engine(self, nl_command: str) -> str:
-        """
-        Returns a deterministic skill program based on keywords in the command.
-        NOT Phi-3 inference — for development and CI only.
+    # def _mock_engine(self, nl_command: str) -> str:
+    #     """
+    #     Returns a deterministic skill program based on keywords in the command.
+    #     NOT Phi-3 inference — for development and CI only.
 
-        TODO: HARDWARE — this entire method is mock data. In production the
-        llama_cpp or onnx_rocm engine is used instead (see _init_backend).
-        This only runs when neither backend is available or backend="mock".
-        """
-        cmd = nl_command.lower()
+    #     TODO: HARDWARE — this entire method is mock data. In production the
+    #     llama_cpp or onnx_rocm engine is used instead (see _init_backend).
+    #     This only runs when neither backend is available or backend="mock".
+    #     """
+    #     cmd = nl_command.lower()
 
-        # Detect slot-specific commands
-        slots: list[int] = []
-        for i in (1, 2, 3):
-            if str(i) in cmd or ("one" == cmd.split()[-1] and i == 1):
-                slots.append(i)
-        if not slots:
-            slots = [1, 2]  # default: fill slots 1 and 2
+    #     # Detect slot-specific commands
+    #     slots: list[int] = []
+    #     for i in (1, 2, 3):
+    #         if str(i) in cmd or ("one" == cmd.split()[-1] and i == 1):
+    #             slots.append(i)
+    #     if not slots:
+    #         slots = [1, 2]  # default: fill slots 1 and 2
 
-        steps = [
-            {
-                "step_id": 0,
-                "action": "scan_shelf",
-                "verification_query": "Are there empty slots visible on the shelf?",
-                "expected_result": True,
-            }
-        ]
-        step_id = 1
-        for slot in slots:
-            steps.append({
-                "step_id": step_id,
-                "action": "pick_from_box",
-                "verification_query": "Is an object held securely in the gripper?",
-                "expected_result": True,
-            })
-            step_id += 1
-            steps.append({
-                "step_id": step_id,
-                "action": f"place_slot_{slot}",
-                "verification_query": f"Is there an item standing upright in shelf slot {slot}?",
-                "expected_result": True,
-            })
-            step_id += 1
-        steps.append({
-            "step_id": step_id,
-            "action": "check_box_empty",
-            "verification_query": "Is the source box empty?",
-            "expected_result": True,
-        })
+    #     steps = [
+    #         {
+    #             "step_id": 0,
+    #             "action": "scan_shelf",
+    #             "verification_query": "Are there empty slots visible on the shelf?",
+    #             "expected_result": True,
+    #         }
+    #     ]
+    #     step_id = 1
+    #     for slot in slots:
+    #         steps.append({
+    #             "step_id": step_id,
+    #             "action": "pick_from_box",
+    #             "verification_query": "Is an object held securely in the gripper?",
+    #             "expected_result": True,
+    #         })
+    #         step_id += 1
+    #         steps.append({
+    #             "step_id": step_id,
+    #             "action": f"place_slot_{slot}",
+    #             "verification_query": f"Is there an item standing upright in shelf slot {slot}?",
+    #             "expected_result": True,
+    #         })
+    #         step_id += 1
+    #     steps.append({
+    #         "step_id": step_id,
+    #         "action": "check_box_empty",
+    #         "verification_query": "Is the source box empty?",
+    #         "expected_result": True,
+    #     })
 
-        skill_name = "stock_shelf_mock"
-        if "slot" in cmd:
-            slot_str = "_".join(f"slot_{s}" for s in slots)
-            skill_name = f"stock_{slot_str}_mock"
+    #     skill_name = "stock_shelf_mock"
+    #     if "slot" in cmd:
+    #         slot_str = "_".join(f"slot_{s}" for s in slots)
+    #         skill_name = f"stock_{slot_str}_mock"
 
-        return json.dumps({
-            "skill_name": skill_name,
-            "description": f"[MOCK] {nl_command}",
-            "steps": steps,
-            "parameters": {
-                "z_offset_mm": 0.0,
-                "speed_scale": 1.0,
-                "approach_angle_deg": 0.0,
-                "gripper_close_force": 0.6,
-                "retry_count": 2,
-            },
-        })
+    #     return json.dumps({
+    #         "skill_name": skill_name,
+    #         "description": f"[MOCK] {nl_command}",
+    #         "steps": steps,
+    #         "parameters": {
+    #             "z_offset_mm": 0.0,
+    #             "speed_scale": 1.0,
+    #             "approach_angle_deg": 0.0,
+    #             "gripper_close_force": 0.6,
+    #             "retry_count": 2,
+    #         },
+    #     })
 
     # ------------------------------------------------------------------
     # JSON parsing and validation
@@ -398,24 +415,75 @@ class SkillCompiler:
 
     def _parse_and_validate(self, raw: str) -> dict[str, Any]:
         """Extract and validate JSON from model output."""
-        # Strip markdown code fences if the model added them
         cleaned = raw.strip()
+
+        # Strip markdown code fences if the model added them
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
             cleaned = cleaned.strip()
 
+        # Phi-3 often appends explanatory text after the JSON object
+        # (e.g. "\n\nNote: ..."). Find the outermost {...} and discard the rest.
+        cleaned = self._extract_first_json_object(cleaned)
+
         try:
-            skill = json.loads(cleaned)
+            parsed = json.loads(cleaned)
         except json.JSONDecodeError as e:
             raise ValueError(
                 f"Compiler output is not valid JSON.\n"
                 f"Raw output: {raw!r}\n"
+                f"Cleaned: {cleaned!r}\n"
                 f"Error: {e}"
             ) from e
 
-        self._validate_schema(skill)
-        return skill
+        # Phi-3 sometimes wraps the skill object in a single parent key,
+        # e.g. {"result": {...}} or {"skill_program": {...}}.
+        required_top = {"skill_name", "description", "steps", "parameters"}
+        if not (required_top & parsed.keys()) and len(parsed) == 1:
+            inner = next(iter(parsed.values()))
+            if isinstance(inner, dict):
+                logger.debug(
+                    "Unwrapping model response: top-level key %r",
+                    next(iter(parsed.keys())),
+                )
+                parsed = inner
+
+        self._validate_schema(parsed)
+        return parsed
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> str:
+        """
+        Return the substring covering the first complete {...} JSON object.
+        Handles nested braces. If no object is found, returns the original text
+        so the caller gets a clear JSONDecodeError rather than a silent miss.
+        """
+        start = text.find("{")
+        if start == -1:
+            return text
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(text[start:], start=start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        return text  # malformed — let json.loads produce the error
 
     def _validate_schema(self, skill: dict) -> None:
         """Raise ValueError if required fields are missing or malformed."""
@@ -434,8 +502,8 @@ class SkillCompiler:
                 raise ValueError(f"Step {i} missing fields: {missing_step}")
 
         required_params = {
-            "z_offset_mm", "speed_scale", "approach_angle_deg",
-            "gripper_close_force", "retry_count",
+            "z_offset_mm", "speed_scale", "approach_angle_deg", "retry_count",
+            # "gripper_close_force"
         }
         params = skill.get("parameters", {})
         missing_params = required_params - params.keys()
