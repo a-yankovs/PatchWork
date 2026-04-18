@@ -80,10 +80,10 @@ def log_event(
     step_id: Optional[int] = None,
     failure_type: Optional[str] = None,
     patch_applied: Optional[dict] = None,
-    gpu_latency_ms: Optional[float] = None,  # orchestrator uses this name; stored as npu_latency_ms
+    gpu_latency_ms: Optional[float] = None,  # bridges orchestrator's "gpu_latency_ms" → TraceEvent.npu_latency_ms
     retry: bool = False,
 ) -> None:
-    # Normalise orchestrator's "patched_success" → "PATCHED" so dashboard colors it correctly
+    # normalises "patched_success" → "PATCHED" so dashboard result colors work correctly
     normalised = "PATCHED" if result == "patched_success" else result.upper() if result else result
     _default_logger.log(TraceEvent(
         skill=skill,

@@ -19,8 +19,8 @@ import streamlit as st
 TRACE_FILE   = Path("trace.jsonl")
 PATCHES_FILE = Path("patches.json")
 
-NPU_TARGET_MS   = 120.0
-CPU_BASELINE_MS = 820.0
+NPU_TARGET_MS   = 120.0   # AMD real-time robotics target; anything above this turns orange
+CPU_BASELINE_MS = 820.0   # measured baseline: same Moondream2 query on CPU-only
 
 SKILL_STEPS = [
     {"step_id": 0, "action": "scan_shelf",      "label": "Scan Shelf"},
@@ -107,29 +107,40 @@ class _CameraServer:
 
     # ── camera lifecycle ───────────────────────────────────────────────────────
     def open(self) -> None:
-        # VideoCapture init blocks 1-4s on Windows/DirectShow — fire to a
-        # background thread so the <img> tag renders immediately and frames
-        # stream in as soon as the camera is ready.
+        # DirectShow init blocks 1-4s — background thread so UI renders immediately
         with self._lock:
             self._streaming_enabled = True
             self._health_check_stop = False
         threading.Thread(target=self._open_sync, daemon=True).start()
+        # restart health check (may have been stopped by a prior close())
+        t = threading.Thread(target=self._health_check_loop, daemon=True)
+        self._health_check_thread = t
+        t.start()
+
+    def _open_one(self, idx: int) -> cv2.VideoCapture | None:
+        # DirectShow requires sequential device init on Windows — do NOT call from parallel threads
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
 
     def _open_sync(self) -> None:
-        new_handles = []
-        for idx in CAMERA_INDICES:
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                cap.set(cv2.CAP_PROP_FPS, 30)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                new_handles.append(cap)
-            else:
-                cap.release()
-                new_handles.append(None)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(CAMERA_INDICES)) as ex:
+            new_handles = list(ex.map(self._open_one, CAMERA_INDICES))
         with self._lock:
+            # Guard: if close() fired while we were initialising, discard and don't overwrite
+            if not self._streaming_enabled:
+                for cap in new_handles:
+                    if cap:
+                        cap.release()
+                return
             for cap in self._handles:
                 if cap:
                     cap.release()
@@ -144,60 +155,39 @@ class _CameraServer:
                     cap.release()
             self._handles = []
 
+    def _health_check_loop(self) -> None:
+        # Reconnects any camera slot that dropped to None while streaming is active
+        while not self._health_check_stop:
+            time.sleep(1.0)
+            if not self._streaming_enabled or self._health_check_stop:
+                continue
+            with self._lock:
+                # use enumerate so slot position matches _handles list index
+                for slot, (dev_idx, cap) in enumerate(zip(CAMERA_INDICES, self._handles)):
+                    if cap is None:
+                        new_cap = self._open_one(dev_idx)
+                        if new_cap:
+                            self._handles[slot] = new_cap
+
     def _start_health_check(self) -> None:
-        """Start background thread that monitors and reconnects cameras."""
-        def health_check_loop() -> None:
-            while not self._health_check_stop:
-                time.sleep(1.0)  # Check every 1 second
-                
-                if not self._streaming_enabled or self._health_check_stop:
-                    continue
-                
-                with self._lock:
-                    # Try to re-open any cameras marked as None
-                    for idx in CAMERA_INDICES:
-                        if idx >= len(self._handles):
-                            continue
-                        if self._handles[idx] is None:
-                            # Try to reconnect
-                            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                            if cap.isOpened():
-                                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-                                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                                cap.set(cv2.CAP_PROP_FPS, 30)
-                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                                self._handles[idx] = cap
-                            else:
-                                cap.release()
-        
-        self._health_check_thread = threading.Thread(target=health_check_loop, daemon=True)
+        self._health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         self._health_check_thread.start()
 
     # ── frame production ───────────────────────────────────────────────────────
-    def _next_jpeg(self, idx: int) -> bytes | None:
+    def _next_jpeg(self, idx: int) -> bytes:
+        # Hold lock for the entire read so close() cannot release the cap mid-read
         with self._lock:
             if not self._streaming_enabled or idx >= len(self._handles):
                 return self._blank_frame()
             cap = self._handles[idx]
             if cap is None:
-                # Camera was never available
                 return self._blank_frame()
-        
-        # Read outside the lock for speed
-        ret, frame_bgr = cap.read()
-        
-        # If read fails (camera unplugged), mark as unavailable
-        if not ret or not cap.isOpened():
-            with self._lock:
-                if idx < len(self._handles) and self._handles[idx] is cap:
-                    cap.release()
-                    self._handles[idx] = None
-            return self._blank_frame()
-        
-        # Resize and encode as fast as possible
+            ret, frame_bgr = cap.read()
+            if not ret:
+                cap.release()
+                self._handles[idx] = None
+                return self._blank_frame()
         frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
-        # Use fast JPEG encoding (quality 75 for speed, still good quality)
         _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
         return buf.tobytes()
 
@@ -313,6 +303,7 @@ with col_badge:
 st.markdown("<hr style='border-color:#2D3748; margin:0.5rem 0;'>", unsafe_allow_html=True)
 
 
+# polls trace.jsonl + patches.json every 500ms and redraws only this fragment, not the full page
 @st.fragment(run_every=0.5)
 def live_dashboard() -> None:
     events  = load_trace()
@@ -525,7 +516,7 @@ def live_dashboard() -> None:
     st.markdown("<hr style='border-color:#2D3748; margin:0.4rem 0;'>", unsafe_allow_html=True)
 
     # ── execution trace ───────────────────────────────────────────────────────
-    st.markdown("#### Execution Trace")
+    st.markdown("#### Execution Traces")
     skill_events = [e for e in events if e.get("type") != "SIMULATION_COMPLETE"]
     if not skill_events:
         st.markdown("<div style='color:#4A5568; padding:16px 0;'>No events yet — "
@@ -535,7 +526,7 @@ def live_dashboard() -> None:
         rows = []
         for e in reversed(skill_events[-60:]):
             rows.append({
-                "Timestamp": datetime.fromtimestamp(e.get("timestamp", 0)).strftime("%H:%M:%S"),
+                "Timestamp": datetime.fromtimestamp(e.get("timestamp", 0)).strftime("%I:%M:%S %p") + " EST",
                 "Step":    e.get("step_id", "—"),
                 "Action":  e.get("action", "—"),
                 "Result":  e.get("result", "—"),
@@ -557,7 +548,7 @@ def live_dashboard() -> None:
     # ── patch memory ──────────────────────────────────────────────────────────
     st.markdown("#### Patch Memory")
     st.markdown("<p style='color:#8892A4; font-size:0.82rem; margin-top:-6px;'>"
-                "Every row is a failure the system has diagnosed and will never repeat — "
+                "Every row is a failure the system has diagnosed and aims to not repeat the same failure cause again — "
                 "the data flywheel that makes each deployment more reliable over time.</p>",
                 unsafe_allow_html=True)
     if not patches:
@@ -578,6 +569,7 @@ def live_dashboard() -> None:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+# st.fragment(run_every=0.5) re-executes only this function on a timer without re-running the full page
 @st.fragment(run_every=0.5)
 def camera_feeds() -> None:
     srv = _camera_server()
@@ -589,8 +581,7 @@ def camera_feeds() -> None:
     with cam_toggle:
         cameras_on = st.toggle("Enable Camera", key="cameras_enabled", value=False)
 
-    # open/close only on toggle edge; cache-bust token forces browser to make a
-    # fresh HTTP request on re-enable (same URL would reuse the dead connection)
+    # edge detection: open/close fires exactly once per toggle transition, not every 500ms rerun
     was_on = st.session_state.get("_cam_was_on", False)
     if cameras_on and not was_on:
         srv.open()
