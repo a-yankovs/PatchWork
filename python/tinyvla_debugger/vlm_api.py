@@ -37,51 +37,69 @@ BACKEND_CPU  = "cpu"    # CPUExecutionProvider   (last resort / tests)
 # Public API
 # ---------------------------------------------------------------------------
 
-def verify(
-    frame: np.ndarray,
-    query: str,
-    backend: str = BACKEND_ROCM,
-) -> tuple[bool, float]:
-    """
-    Run a natural language verification query against a camera frame.
+"""vlm_api.py — On-device VLM verification via Ollama + Moondream2
+Owner: Sasha
 
-    Uses Moondream2 INT4 quantized via AMD's Olive tool, loaded on the
-    ROCm GPU through ONNX Runtime's ROCMExecutionProvider.
+Runs Moondream2 on AMD Radeon 890M via ROCm (25/25 layers on GPU).
+Custom Modelfile for yes/no verification queries.
+Fully on-device, no cloud.
+Latency: ~100ms per verify() call (warm).
 
-    The four shelf-stocking queries the orchestrator will call:
-      1. "Is an object held securely in the gripper?"  — post-pick
-      2. "Is this shelf slot currently empty?"         — pre-placement check
-      3. "Is there an item standing upright in this shelf slot?" — post-place
-      4. "Is the source box empty?"                    — end-of-task detection
+Usage:
+    from vlm_api import verify
+    result, latency_ms = verify(frame, "grasp_check")
 
-    Args:
-        frame:   BGR image as numpy array (H, W, 3), uint8.
-                 Captured from webcam immediately after the step completes.
-        query:   Natural language yes/no question about the scene.
-        backend: Execution provider — use BACKEND_ROCM (default) or
-                 BACKEND_CPU. ROCMExecutionProvider requires onnxruntime-rocm.
+Query types:
+    "grasp_check"  - is an object held in the gripper?
+    "slot_empty"   - is the shelf slot empty?
+    "slot_filled"  - is an item upright in the slot?
+    "box_empty"    - is the source box empty?
 
-    Returns:
-        (result, latency_ms):
-            result     — True if the VLM answers "yes", False otherwise.
-            latency_ms — Wall-clock inference time in milliseconds.
+Returns:
+    (bool, float) - (result, latency_ms)
+"""
 
-    Raises:
-        NotImplementedError: Until Sasha's implementation lands.
+import requests
+import base64
+import time
+import cv2
 
-    Example:
-        >>> result, ms = verify(frame, "Is an object held securely in the gripper?")
-        >>> print(f"Gripper check: {result} in {ms:.1f}ms")
-    """
-    # TODO: HARDWARE — replace this entire block with real Moondream2 ONNX inference.
-    # Steps:
-    #   1. Load model: ort.InferenceSession("models/moondream2-int4.onnx",
-    #                                        providers=["ROCMExecutionProvider"])
-    #   2. Preprocess frame: resize to 378x378, normalize to float32
-    #   3. Tokenize query with Moondream2 tokenizer
-    #   4. Run session.run() and decode yes/no logits
-    #   5. Record wall-clock time around step 4 for latency_ms
-    raise NotImplementedError(
-        "vlm_api.verify not yet implemented — waiting for Sasha. "
-        "Use a mock in tests: return (True, 95.0) for success scenarios."
-    )
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL = "moondream-verify"
+
+QUERIES = {
+    "grasp_check": "Is there an object being held in the gripper?",
+    "slot_empty": "Is this shelf slot empty?",
+    "slot_filled": "Is there an item standing upright on the shelf?",
+    "box_empty": "Is the source box empty?",
+}
+
+def verify(frame, query_type):
+    question = QUERIES.get(query_type)
+    if not question:
+        return False, 0.0
+
+    _, buf = cv2.imencode('.jpg', frame)
+    img_b64 = base64.b64encode(buf).decode()
+
+    start = time.perf_counter()
+    resp = requests.post(OLLAMA_URL, json={
+        "model": MODEL,
+        "prompt": question,
+        "images": [img_b64],
+        "stream": False
+    })
+    latency = (time.perf_counter() - start) * 1000
+    answer = resp.json()["response"].strip().lower()
+    result = answer.startswith("yes")
+
+    return result, latency
+
+if __name__ == "__main__":
+    import numpy as np
+
+    frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+
+    for qt in ["grasp_check", "slot_empty", "slot_filled", "box_empty"]:
+        result, latency = verify(frame, qt)
+        print(f"{qt:15s} | {str(result):5s} | {latency:.0f}ms")
