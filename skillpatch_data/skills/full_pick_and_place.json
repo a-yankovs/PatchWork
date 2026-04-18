@@ -1,0 +1,29 @@
+{
+  "skill_name": "full_pick_and_place",
+  "description": "Pick an object from the scene and place it into the target box.",
+  "steps": [
+    {
+      "step_id": 0,
+      "name": "pick_object",
+      "dataset_repo_id": "./data/pick_object_v5",
+      "verification_query": "Is an object held securely in the gripper?",
+      "expected_result": true,
+      "description": "Pick the object."
+    },
+    {
+      "step_id": 1,
+      "name": "place_in_box",
+      "dataset_repo_id": "./data/place_in_box_v4",
+      "verification_query": "Is the object now placed inside the box?",
+      "expected_result": true,
+      "description": "Place into box."
+    }
+  ],
+  "default_params": {
+    "z_offset_mm": 0.0,
+    "speed_scale": 1.0,
+    "approach_angle_deg": 0.0,
+    "gripper_close_force": 0.6,
+    "retry_count": 2
+  }
+}

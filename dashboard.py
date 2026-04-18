@@ -89,6 +89,10 @@ def _get_slot_map() -> dict[int, int]:
     # index 1 → slot 0 (Follower — Top), index 2 → slot 1 (Follower — Side); never touch 0 (laptop)
     return {1: 0, 2: 1}
 
+# Indices 1, 2 = external USB webcams (index 0 = laptop built-in, skipped).
+CAMERA_INDICES = [1, 2]
+CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
+
 RESULT_COLOR = {
     "PASS":           "#00D4AA",
     "PATCHED":        "#FF8C00",
@@ -186,7 +190,7 @@ class _CameraServer:
         return None
 
     def _open_sync(self) -> None:
-        slot_map = _get_slot_map()  # {opencv_idx: slot} keyed by physical USB port identity
+        slot_map = _get_slot_map()
         new_handles: list[cv2.VideoCapture | None] = [None, None]
         for dev_idx, slot in slot_map.items():
             cap = self._open_one(dev_idx)
@@ -213,7 +217,6 @@ class _CameraServer:
             self._handles = []
 
     def _health_check_loop(self) -> None:
-        # re-queries USB port mapping every 0.5s to detect hot-plug into correct slot
         while not self._health_check_stop:
             time.sleep(0.5)
             if not self._streaming_enabled or self._health_check_stop:
@@ -696,7 +699,6 @@ def live_dashboard() -> None:
         st.dataframe(pd.DataFrame(archive_rows), use_container_width=True, hide_index=True, height=175)
 
 
-# st.fragment(run_every=0.5) re-executes only this function on a timer without re-running the full page
 @st.fragment(run_every=0.5)
 def camera_feeds() -> None:
     srv = _camera_server()
@@ -708,7 +710,7 @@ def camera_feeds() -> None:
     with cam_toggle:
         cameras_on = st.toggle("Enable Camera", key="cameras_enabled", value=False)
 
-    # edge detection: open/close fires exactly once per toggle transition, not every 500ms rerun
+    # open/close only on toggle edge; cache-bust token forces browser fresh HTTP connection on re-enable
     was_on = st.session_state.get("_cam_was_on", False)
     if cameras_on and not was_on:
         srv.open()

@@ -155,10 +155,18 @@ class SpeechListener:
             return self._listen_stdin(prompt)
 
         print("done.")
-        print("   Transcribing ... ", end="", flush=True)
 
         # flatten to 1-D (sounddevice returns (N, 1) for mono)
         audio_1d: np.ndarray = audio[:, 0] if audio.ndim == 2 else audio
+
+        # Silence check — RMS below threshold means no speech was detected.
+        # Whisper hallucinates plausible text from background noise if we skip this.
+        rms = float(np.sqrt(np.mean(audio_1d ** 2)))
+        if rms < 0.01:
+            print("(silence detected)")
+            return self._listen_stdin("No speech detected. Type your command instead:")
+
+        print("   Transcribing ... ", end="", flush=True)
 
         try:
             segments, info = self._model.transcribe(
@@ -166,6 +174,8 @@ class SpeechListener:
                 beam_size=1,
                 language="en",
                 condition_on_previous_text=False,
+                no_speech_threshold=0.6,   # discard segments Whisper itself flags as non-speech
+                log_prob_threshold=-1.0,   # discard low-confidence transcriptions
             )
             text = " ".join(seg.text for seg in segments).strip()
         except Exception as exc:
@@ -177,7 +187,7 @@ class SpeechListener:
             return text
 
         logger.warning("Whisper returned empty transcription — falling back to stdin")
-        return self._listen_stdin("Empty audio captured. Type your command instead:")
+        return self._listen_stdin("No speech detected. Type your command instead:")
 
     # ------------------------------------------------------------------
     # Internal — mock stdin path

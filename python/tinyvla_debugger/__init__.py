@@ -15,7 +15,8 @@ Module map  (owner — mock status)
     [MOCK] keyword-based deterministic routing; used when no GPU/model found
 
   robot_api.py      Layer 2  — skill execution interface      (Diya)
-    [STUB] all three functions raise NotImplementedError — awaiting Diya
+    [REAL] RobotAPI class wraps LeRobot CLI (record/replay/patch)
+    Requires: lerobot installed, SO-100 arm connected, skill manifests recorded
 
   vlm_api.py        Layer 3  — on-device scene verifier       (Sasha)
     [REAL] Moondream2 via Ollama at localhost:11434 (AMD ROCm, 25/25 layers)
@@ -51,6 +52,7 @@ from .compiler import SkillCompiler
 from .classifier import FailureClassifier
 from .patch_library import PatchLibrary
 from .orchestrator import Orchestrator, SkillAbortError
+from .robot_api import RobotAPI, ReplayParams, StepSpec, SkillSpec, StepEvent
 from .stt import SpeechListener
 from .webcam_stream import WebcamStream
 
@@ -60,6 +62,11 @@ __all__ = [
     "PatchLibrary",
     "Orchestrator",
     "SkillAbortError",
+    "RobotAPI",
+    "ReplayParams",
+    "StepSpec",
+    "SkillSpec",
+    "StepEvent",
     "SpeechListener",
     "WebcamStream",
 ]

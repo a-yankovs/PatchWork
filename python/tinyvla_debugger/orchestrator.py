@@ -9,13 +9,16 @@ It owns the state machine for skill execution:
     → Layer 1: compiler.py     compile to skill program JSON
     → load patch library, pre-apply known patches to params
     → for each step:
+        → Layer 3: vlm_api     pre-check scene precondition (camera BEFORE replay)
+        → if pre-check FAIL: skip replay, classify, patch, retry
         → Layer 2: robot_api   replay step with current params
-        → Layer 3: vlm_api     verify step result
+        → Layer 3: vlm_api     post-verify step result
         → if PASS: log, continue
         → if FAIL:
             → Layer 4a: classifier   determine failure_type
             → Layer 4b: patch_library look up / create patch
             → apply patch to params
+            → Layer 3: vlm_api       pre-check again before retry
             → Layer 2: robot_api     replay step again (patched)
             → Layer 3: vlm_api       verify again
             → if PASS: log patched_success, store patch, continue
@@ -55,6 +58,17 @@ from . import trace_logger
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES_PER_STEP = 2   # spec: "orchestrator enforces a max retry count of 2"
+
+# Pre-conditions checked via VLM *before* each lerobot-replay call.
+# If the scene doesn't satisfy the pre-condition the replay is skipped entirely
+# and the step is counted as a failure (triggering the normal retry/patch path).
+# Tuple: (query, expected_result)
+_PRE_CHECK: dict[str, tuple[str, bool]] = {
+    "pick_object":         ("Is there an object visible and accessible in the pick zone?", True),
+    "place_in_box":        ("Is an object currently held in the gripper?", True),
+    "full_pick_and_place": ("Is there an object visible and accessible in the pick zone?", True),
+    "box_in_shelf":        ("Is a box held securely in the gripper?", True),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -142,11 +156,20 @@ class Orchestrator:
         self.compiler = SkillCompiler(backend=compiler_backend)
 
         # Layer 2 — robot (real or mock)
+        # Pass a RobotAPI instance explicitly for real hardware, or MockRobotAPI for tests.
+        # Auto-instantiation from env vars is the fallback when no robot is provided.
         if robot is not None:
             self._robot = robot
         else:
-            from . import robot_api as _robot_api
-            self._robot = _robot_api  # type: ignore[assignment]
+            import os
+            from .robot_api import RobotAPI
+            self._robot = RobotAPI(
+                robot_port=os.environ.get("ROBOT_PORT", "/dev/ttyUSB0"),
+                teleop_port=os.environ.get("TELEOP_PORT", "/dev/ttyUSB1"),
+                robot_id=os.environ.get("ROBOT_ID", "follower_arm"),
+                teleop_id=os.environ.get("TELEOP_ID", "leader_arm"),
+                storage_dir=os.environ.get("ROBOT_STORAGE_DIR", "./skillpatch_data"),
+            )
 
         # Layer 3 — VLM (real or mock)
         if vlm is not None:
@@ -311,11 +334,68 @@ class Orchestrator:
         for attempt in range(MAX_RETRIES_PER_STEP):
             is_retry = attempt > 0
 
+            # --- Pre-check: verify scene precondition before moving the arm ---
+            pre_check = _PRE_CHECK.get(action)
+            if pre_check is not None:
+                pre_query, pre_expected = pre_check
+                pre_frame = await asyncio.get_event_loop().run_in_executor(
+                    None, self._capture_frame
+                )
+                pre_ok, pre_latency = self._vlm.verify(pre_frame, pre_query)
+                logger.info(
+                    "Pre-check step %d action=%r: %r → %s (expected %s)",
+                    step_id, action, pre_query, pre_ok, pre_expected,
+                )
+                if pre_ok != pre_expected:
+                    # Scene isn't ready — skip the replay and treat as a step
+                    # failure so the normal classifier/patch/retry path handles it.
+                    logger.warning(
+                        "Pre-check FAILED for step %d (%s): scene not ready — skipping replay",
+                        step_id, action,
+                    )
+                    trace_logger.log_event(
+                        skill=skill_name,
+                        step_id=step_id,
+                        action=action,
+                        result="pre_check_fail",
+                        gpu_latency_ms=pre_latency,
+                        retry=is_retry,
+                    )
+                    # Jump straight to the failure-handling block below.
+                    # We set verified=False and latency so the rest of the loop
+                    # behaves identically to a post-check failure.
+                    verified    = False
+                    latency_ms  = pre_latency
+                    last_latency_ms = latency_ms
+                    # Skip the replay and post-check entirely for this attempt.
+                    classification = self.classifier.classify(
+                        action, pre_query, verified, retry=is_retry,
+                    )
+                    failure_type = classification.failure_type
+                    if attempt >= MAX_RETRIES_PER_STEP - 1:
+                        trace_logger.log_event(
+                            skill=skill_name, step_id=step_id, action=action,
+                            result="abort", failure_type=failure_type,
+                            patch_applied=None, gpu_latency_ms=latency_ms,
+                            retry=is_retry,
+                        )
+                        return False, patch_applied, last_latency_ms, failure_type
+                    patch = self.patch_library.get_patch(skill_name, failure_type)
+                    if patch:
+                        current_params = self.patch_library.apply_to_params(current_params, patch)
+                        self._robot.apply_patch(skill_name, patch)
+                        patch_applied = True
+                    continue  # retry the attempt loop from the top (pre-check again)
+
             # --- Execute step (run in executor to not block event loop) ---
+            # Pass `action` (the individual sub-skill, e.g. "full_pick_and_place"),
+            # NOT `skill_name` (the compiled task name, e.g. "refill_inventory").
+            # robot_api.replay_skill looks up the manifest by sub-skill name —
+            # the compiled skill_name never has a manifest of its own.
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 self._replay_step,
-                skill_name, current_params,
+                action, current_params,
             )
 
             trace_logger.log_event(
@@ -327,7 +407,7 @@ class Orchestrator:
                 retry=is_retry,
             )
 
-            # --- Capture frame and verify ---
+            # --- Capture frame and post-verify ---
             frame = await asyncio.get_event_loop().run_in_executor(
                 None, self._capture_frame
             )
@@ -546,16 +626,19 @@ class MockRobotAPI:
         from .robot_api import StepEvent
         for i in range(self.num_steps):
             # [MOCK] gripper_state and action name are synthetic.
-            # [REAL] robot_api yields StepEvents from the SO-100 arm
+            # [REAL] RobotAPI yields StepEvents from the SO-100 arm
             #        with live gripper sensor readings and the actual
             #        trajectory action name.
             gripper = "open" if i == self.failure_on_step else "closed"
             yield StepEvent(
+                skill_name=skill_name,
                 step_id=i,
                 action=skill_name,
                 timestamp=time.time(),
+                dataset_repo_id=f"mock/{skill_name}_step_{i}",
                 gripper_state=gripper,
                 params_used=dict(params),
+                result="EXECUTED",
             )
 
     def apply_patch(self, skill_name: str, patch: dict) -> None:

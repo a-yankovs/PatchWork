@@ -1,5 +1,20 @@
 __pycache__/
 *.py[cod]
+
+# macOS artifacts
 .DS_Store
+**/.DS_Store
+Archive/__MACOSX/
+
+# runtime outputs
 trace.jsonl
 patches.json
+skillpatch_data/patches.json
+.camera_cal.json
+
+# large binary dataset copy (canonical source is Archive/)
+data/
+
+# notebooks and scratch files
+*.ipynb
+test_webcam_vlm.py

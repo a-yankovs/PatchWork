@@ -22,7 +22,7 @@ Key options:
     --cmd TEXT      Skip STT, use this text command directly
     --loop          Keep listening for commands (Ctrl+C to exit)
     --verbose       Enable DEBUG logging
-    --webcam N      Webcam device index (default 0)
+    --webcam N      Webcam device index (default 1 — AMD USB cam; use 0 for laptop built-in)
     --model SIZE    Whisper model: tiny|base|small|medium (default: base)
     --record-secs N Mic recording duration in seconds (default: 5)
 """
@@ -36,6 +36,8 @@ import sys
 from typing import Optional
 
 from .orchestrator import Orchestrator, MockRobotAPI, MockVLMAPI, SkillAbortError
+from .audio_feedback import AudioFeedback
+from .robot_api import RobotAPI
 from .stt import SpeechListener
 from .webcam_stream import WebcamStream
 
@@ -62,12 +64,17 @@ def _build_orchestrator(
     webcam_index: int,
     frame_source,
     compiler_backend: str,
+    robot_port: str,
+    teleop_port: str,
+    robot_id: str,
+    teleop_id: str,
+    storage_dir: str,
 ) -> Orchestrator:
     """
     Build the orchestrator with the right backends.
 
-    Mock mode:   MockRobotAPI + MockVLMAPI + mock compiler
-    Real mode:   Real robot_api + real vlm_api + auto-detect compiler backend
+    Mock mode:   MockRobotAPI + MockVLMAPI + mock compiler (no hardware needed)
+    Real mode:   RobotAPI(SO-100) + vlm_api(Moondream2) + Phi-3 compiler
     """
     if mock:
         robot = MockRobotAPI(failure_on_step=1)  # step 1 fails on first attempt → exercises patch path
@@ -78,13 +85,55 @@ def _build_orchestrator(
             compiler_backend="mock",
             webcam_index=webcam_index,
             frame_source=frame_source,
+            audio=AudioFeedback(enabled=False),  # no ElevenLabs calls in mock mode
         )
 
+    # [REAL] Instantiate hardware-backed RobotAPI.
+    # Ports/IDs come from CLI args (or env var fallbacks set in main()).
+    robot = RobotAPI(
+        robot_port=robot_port,
+        teleop_port=teleop_port,
+        robot_id=robot_id,
+        teleop_id=teleop_id,
+        storage_dir=storage_dir,
+    )
     return Orchestrator(
+        robot=robot,
         compiler_backend=compiler_backend,
         webcam_index=webcam_index,
         frame_source=frame_source,
+        # AudioFeedback() default: reads ELEVENLABS_API_KEY from env
     )
+
+
+# ---------------------------------------------------------------------------
+# Keyword normalization
+# ---------------------------------------------------------------------------
+
+# Maps: any of the listed keywords appearing in the transcript → canonical command.
+# Values are (list_of_trigger_words, canonical_command).
+# Trigger words can be exact substrings OR common STT mishearings of the same word.
+_COMMAND_SHORTCUTS: list[tuple[list[str], str]] = [
+    (["inventory", "inventor", "inventori", "inventor."], "refill the inventory"),
+]
+
+
+def _normalize_command(text: str) -> str:
+    """
+    Normalize a raw transcript to a canonical skill command.
+
+    Checks every trigger word for each shortcut (case-insensitive substring match).
+    Returns the canonical command if any trigger matches, otherwise the original.
+    Handles STT mishearings by listing alternate spellings as extra triggers.
+    """
+    lowered = text.lower().strip(".!, ")
+    for triggers, canonical in _COMMAND_SHORTCUTS:
+        for kw in triggers:
+            if kw in lowered:
+                if text.strip() != canonical:
+                    print(f"   ↳ normalized {text!r} → {canonical!r}  (matched {kw!r})")
+                return canonical
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +180,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     print(f"  • STT        → {stt_status}")
     if args.mock:
         print("  • SLM        → mock compiler (no Phi-3 needed)")
-        print("  • Webcam     → synthetic blank frames")
+        print(f"  • Webcam     → device {args.webcam} (AMD USB cam)")
         print("  • VLM        → MockVLMAPI (step 1 fails once, then auto-patches)")
         print("  • Robot      → MockRobotAPI (motion simulated)")
         print("  • Audio      → print-only (no ElevenLabs)")
@@ -139,20 +188,24 @@ async def _main_async(args: argparse.Namespace) -> None:
         print(f"  • SLM        → Phi-3-mini ({args.compiler})")
         print(f"  • Webcam     → device {args.webcam}")
         print("  • VLM        → Moondream2 via Ollama (localhost:11434)")
+        print(f"  • Robot      → SO-100 follower ({args.robot_port}, id={args.robot_id})")
+        print(f"  • Teleop     → SO-100 leader  ({args.teleop_port}, id={args.teleop_id})")
+        print(f"  • Storage    → {args.storage_dir}")
         print("  • Audio      → ElevenLabs TTS (ELEVENLABS_API_KEY)")
 
     # ------------------------------------------------------------------
     # Start webcam stream
     # ------------------------------------------------------------------
-    cam = WebcamStream(index=args.webcam, mock=args.mock)
+    # Always use the real camera (never synthetic frames) — mock mode only
+    # affects robot/VLM/compiler, not the webcam feed.
+    cam = WebcamStream(index=args.webcam, mock=False)
     try:
         cam.start()
     except RuntimeError as exc:
-        if not args.mock:
-            print(f"\n⚠  Webcam error: {exc}")
-            print("   Switching to mock webcam (blank frames).")
-            cam = WebcamStream(mock=True)
-            cam.start()
+        print(f"\n⚠  Webcam error: {exc}")
+        print("   Switching to synthetic blank frames.")
+        cam = WebcamStream(mock=True)
+        cam.start()
 
     try:
         # ------------------------------------------------------------------
@@ -163,6 +216,11 @@ async def _main_async(args: argparse.Namespace) -> None:
             webcam_index=args.webcam,
             frame_source=cam.get_latest_frame,
             compiler_backend=args.compiler,
+            robot_port=args.robot_port,
+            teleop_port=args.teleop_port,
+            robot_id=args.robot_id,
+            teleop_id=args.teleop_id,
+            storage_dir=args.storage_dir,
         )
 
         # ------------------------------------------------------------------
@@ -192,6 +250,7 @@ async def _main_async(args: argparse.Namespace) -> None:
                         args.cmd if args.cmd else
                         listener.listen(f"[{iteration}] Ready. Speak your robot command.")
                     )
+                    command = _normalize_command(command)
                     await _run_once(command, orc)
                     print()  # blank line between runs
                 except KeyboardInterrupt:
@@ -202,6 +261,7 @@ async def _main_async(args: argparse.Namespace) -> None:
                 args.cmd if args.cmd else
                 listener.listen("Ready. Speak your robot command.")
             )
+            command = _normalize_command(command)
             success = await _run_once(command, orc)
             sys.exit(0 if success else 1)
 
@@ -231,15 +291,38 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Skip STT; use this text command directly",
     )
 
-    # --- Hardware ---
+    # --- Hardware: webcam + compiler ---
     parser.add_argument(
-        "--webcam", type=int, default=0, metavar="N",
-        help="OpenCV webcam device index (default: 0)",
+        "--webcam", type=int, default=1, metavar="N",
+        help="OpenCV webcam device index (default: 1 — AMD USB webcam; laptop built-in is 0)",
     )
     parser.add_argument(
         "--compiler", default="auto",
         choices=["auto", "llama_cpp", "onnx_rocm", "mock"],
         help="SLM compiler backend (default: auto — tries llama_cpp then onnx_rocm)",
+    )
+
+    # --- Hardware: robot arm (real mode only, ignored in --mock) ---
+    import os
+    parser.add_argument(
+        "--robot-port", default=os.environ.get("ROBOT_PORT", "/dev/ttyUSB0"),
+        help="Serial port for SO-100 follower arm (default: $ROBOT_PORT or /dev/ttyUSB0)",
+    )
+    parser.add_argument(
+        "--teleop-port", default=os.environ.get("TELEOP_PORT", "/dev/ttyUSB1"),
+        help="Serial port for SO-100 leader arm (default: $TELEOP_PORT or /dev/ttyUSB1)",
+    )
+    parser.add_argument(
+        "--robot-id", default=os.environ.get("ROBOT_ID", "follower_arm"),
+        help="Robot arm identifier (default: $ROBOT_ID or follower_arm)",
+    )
+    parser.add_argument(
+        "--teleop-id", default=os.environ.get("TELEOP_ID", "leader_arm"),
+        help="Teleop arm identifier (default: $TELEOP_ID or leader_arm)",
+    )
+    parser.add_argument(
+        "--storage-dir", default=os.environ.get("ROBOT_STORAGE_DIR", "./skillpatch_data"),
+        help="Directory for skill manifests and patch storage (default: ./skillpatch_data)",
     )
 
     # --- STT ---

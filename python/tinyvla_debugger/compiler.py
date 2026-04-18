@@ -172,6 +172,7 @@ SKILL_REGISTRY: dict[str, dict] = {
         ],
         "parameters": dict(_DEFAULT_PARAMS),
     },
+
 }
 
 
@@ -348,6 +349,7 @@ class SkillCompiler:
             )
             return skill
 
+
         logger.info("Compiling via LLM: %r", nl_command)
         raw = self._engine(nl_command)
         skill = self._parse_and_validate(raw)
@@ -426,18 +428,23 @@ class SkillCompiler:
         )
 
         def engine(nl_command: str) -> str:
-            # Do NOT pass response_format={"type": "json_object"} — the generic
-            # JSON grammar suppresses Phi-3's content generation and produces {}.
-            # The system prompt + _parse_and_validate handle cleanup instead.
-            response = llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": nl_command},
-                ],
+            # Use raw completion and prime the response with "{" so the model
+            # is forced to continue as a JSON object and cannot write prose.
+            # create_chat_completion lets Phi-3 answer conversationally and
+            # ignore the JSON-only instruction; this makes it structurally impossible.
+            prompt = (
+                f"<|system|>\n{_SYSTEM_PROMPT}<|end|>\n"
+                f"<|user|>\n{nl_command}<|end|>\n"
+                f"<|assistant|>\n{{"
+            )
+            response = llm(
+                prompt,
                 temperature=self.temperature,
                 max_tokens=1024,
+                stop=["<|end|>", "<|user|>"],
             )
-            return response["choices"][0]["message"]["content"]
+            # Prepend the priming "{" that we injected above
+            return "{" + response["choices"][0]["text"]
 
         return engine
 
