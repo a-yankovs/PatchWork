@@ -1,1 +1,19 @@
-#python packaging/build entry
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "skillpatch"
+version = "0.1.0"
+description = "Self-Healing Robot Execution Layer — StarkHacks 2026"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.32.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "onnxruntime>=1.17.0",
+]
+
+[project.scripts]
+skillpatch-dashboard = "dashboard:main"
