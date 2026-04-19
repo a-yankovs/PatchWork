@@ -1,22 +1,20 @@
 {
   "skill_name": "full_pick_and_place",
-  "description": "Pick an object from the scene and place it into the target box.",
+  "description": "Pick an object from the scene and place it into the target box — end-to-end recording.",
+  "_recording_versions": [
+    "./data/recordings_cam_v1",
+    "./data/recordings_cam_v2",
+    "./data/recordings_cam_v3",
+    "./data/recordings_v4"
+  ],
   "steps": [
     {
       "step_id": 0,
-      "name": "pick_object",
-      "dataset_repo_id": "./data/pick_object_v5",
-      "verification_query": "Is an object held securely in the gripper?",
-      "expected_result": true,
-      "description": "Pick the object."
-    },
-    {
-      "step_id": 1,
-      "name": "place_in_box",
-      "dataset_repo_id": "./data/place_in_box_v4",
+      "name": "full_pick_and_place",
+      "dataset_repo_id": "./data/recordings_v4",
       "verification_query": "Is the object now placed inside the box?",
       "expected_result": true,
-      "description": "Place into box."
+      "description": "Full end-to-end pick and place — best recording is recordings_v4."
     }
   ],
   "default_params": {
