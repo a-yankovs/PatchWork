@@ -3,7 +3,11 @@
 # the ReAct agentic loop phase, NPU vs CPU latency, execution history, and patch memory.
 
 import json
+import os
+import shutil
 import socket
+import subprocess
+import sys
 import threading
 import math
 import time
@@ -84,15 +88,10 @@ def derive_skill_steps(events: list[dict]) -> list[dict]:
         for sid, act in sorted(seen.items())
     ]
 
-CAMERA_LABELS = ["Follower — Top", "Follower — Side"]
+CAMERA_LABELS = ["AMD Webcam"]
 
 def _get_slot_map() -> dict[int, int]:
-    # index 1 → slot 0 (Follower — Top), index 2 → slot 1 (Follower — Side); never touch 0 (laptop)
-    return {1: 0, 2: 1}
-
-# Indices 1, 2 = external USB webcams (index 0 = laptop built-in, skipped).
-CAMERA_INDICES = [1, 2]
-CAMERA_LABELS  = ["Follower — Top", "Follower — Side"]
+    return {1: 0}   # AMD USB webcam at index 1
 
 RESULT_COLOR = {
     "PASS":           "#00D4AA",
@@ -256,26 +255,21 @@ class _CameraServer:
         t.start()
 
     def _open_one(self, idx: int) -> cv2.VideoCapture | None:
-        # try DSHOW (most reliable on Windows for USB webcams); never call while holding self._lock
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
-            cap = cv2.VideoCapture(idx, backend)
-            if not cap.isOpened():
-                cap.release()
-                continue
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            ret, _ = cap.read()  # verify frames actually flow before returning
-            if ret:
-                return cap
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
             cap.release()
-        return None
+            return None
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
 
     def _open_sync(self) -> None:
         slot_map = _get_slot_map()
-        new_handles: list[cv2.VideoCapture | None] = [None, None]
+        n_slots = max(slot_map.values()) + 1 if slot_map else 1
+        new_handles: list[cv2.VideoCapture | None] = [None] * n_slots
         for dev_idx, slot in slot_map.items():
             cap = self._open_one(dev_idx)
             if cap:
@@ -328,24 +322,22 @@ class _CameraServer:
 
     # ── frame production ───────────────────────────────────────────────────────
     def _next_jpeg(self, slot: int) -> bytes:
-    # hold lock for full read so close() cannot release the cap mid-read
-    with self._lock:
-        if not self._streaming_enabled or slot >= len(self._handles):
-            return self._placeholder()
-        cap = self._handles[slot]
-        if cap is None:
-            return self._placeholder()
-        ret, frame_bgr = cap.read()
-        if not ret:
-            cap.release()
-            self._handles[slot] = None
-            return self._placeholder()
+        with self._lock:
+            if not self._streaming_enabled or slot >= len(self._handles):
+                return self._placeholder()
+            cap = self._handles[slot]
+            if cap is None:
+                return self._placeholder()
+            ret, frame_bgr = cap.read()
+            if not ret:
+                cap.release()
+                self._handles[slot] = None
+                return self._placeholder()
 
-    frame_bgr = draw_robot_overlay(frame_bgr, slot)
-
-    frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
-    _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
-    return buf.tobytes()
+        frame_bgr = draw_robot_overlay(frame_bgr, slot)
+        frame_small = cv2.resize(frame_bgr, (480, 360), interpolation=cv2.INTER_LINEAR)
+        _, buf = cv2.imencode(".jpg", frame_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        return buf.tobytes()
 
     def _placeholder(self) -> bytes:
         if not hasattr(self, "_placeholder_cache"):
@@ -786,18 +778,17 @@ def live_dashboard() -> None:
         st.dataframe(pd.DataFrame(archive_rows), use_container_width=True, hide_index=True, height=175)
 
 
-@st.fragment(run_every=0.5)
+@st.fragment
 def camera_feeds() -> None:
     srv = _camera_server()
 
-    cam_header, cam_toggle = st.columns([5, 1])
-    with cam_header:
+    hdr, tog = st.columns([5, 1])
+    with hdr:
         st.markdown("<p style='color:#8892A4; font-size:0.78rem; margin:6px 0 4px 0;'>LIVE CAMERA FEEDS</p>",
                     unsafe_allow_html=True)
-    with cam_toggle:
+    with tog:
         cameras_on = st.toggle("Enable Camera", key="cameras_enabled", value=False)
 
-    # open/close only on toggle edge; cache-bust token forces browser fresh HTTP connection on re-enable
     was_on = st.session_state.get("_cam_was_on", False)
     if cameras_on and not was_on:
         srv.open()
@@ -808,7 +799,8 @@ def camera_feeds() -> None:
 
     if cameras_on:
         token = st.session_state.get("_cam_token", 0)
-        cam_cols = st.columns(2)
+        n = len(CAMERA_LABELS)
+        cam_cols = st.columns(n)
         for i, label in enumerate(CAMERA_LABELS):
             with cam_cols[i]:
                 st.markdown(
@@ -822,14 +814,77 @@ def camera_feeds() -> None:
         st.markdown(
             "<div style='background:#161B27;border:1px dashed #2D3748;border-radius:8px;"
             "padding:16px;text-align:center;color:#4A5568;font-size:0.8rem;'>"
-            "Toggle <b style='color:#8892A4;'>Enable Camera</b> above to activate AMD webcams"
+            "Toggle <b style='color:#8892A4;'>Enable Camera</b> above to start the feed"
             "</div>",
             unsafe_allow_html=True,
         )
 
 
+def _list_com_ports() -> list[str]:
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM")
+        ports, i = [], 0
+        while True:
+            try:
+                _, val, _ = winreg.EnumValue(key, i)
+                ports.append(val); i += 1
+            except OSError:
+                break
+        return ports
+    except Exception:
+        return []
+
+def _arm_connected() -> bool:
+    configured = os.environ.get("ROBOT_PORT", "")
+    live = _list_com_ports()
+    has_lerobot = shutil.which("lerobot-replay") is not None
+    if configured and configured in live:
+        return True
+    return bool(live and has_lerobot)
+
+_sim_script = Path(__file__).parent / "scripts" / "simulate_failure.py"
+
+@st.fragment
+def run_control() -> None:
+    proc: subprocess.Popen | None = st.session_state.get("_sim_proc")
+    running = proc is not None and proc.poll() is None
+    arm_on = _arm_connected()
+
+    _, mid, _ = st.columns([2, 1, 2])
+    with mid:
+        if running:
+            if st.button("⏹ Stop", use_container_width=True):
+                proc.terminate()
+                st.session_state["_sim_proc"] = None
+                st.rerun(scope="fragment")
+        else:
+            label = "▶ Run Robot" if arm_on else "▶ Run Simulation"
+            if st.button(label, use_container_width=True, type="primary"):
+                if TRACE_FILE.exists():
+                    TRACE_FILE.unlink()
+                cmd = (
+                    [sys.executable, "-m", "tinyvla_debugger",
+                     "--cmd", "refill the inventory", "--loop"]
+                    if arm_on
+                    else [sys.executable, str(_sim_script)]
+                )
+                st.session_state["_sim_proc"] = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                st.session_state["session_start"] = datetime.now().timestamp()
+                st.rerun(scope="fragment")
+
+    if running:
+        color = "#00D4AA" if arm_on else "#FF8C00"
+        lbl = "● Robot running" if arm_on else "● Simulation running"
+        st.markdown(f"<p style='color:{color};font-size:0.75rem;text-align:center;margin:2px 0;'>{lbl}</p>",
+                    unsafe_allow_html=True)
+
+
 if "session_start" not in st.session_state:
     st.session_state.session_start = datetime.now().timestamp()
 
+run_control()
 camera_feeds()
 live_dashboard()
