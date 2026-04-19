@@ -40,6 +40,13 @@ TELEOP_PORT  = os.environ.get("TELEOP_PORT", "/dev/ttyACM2")
 ROBOT_ID     = os.environ.get("ROBOT_ID",    "follower_arm")
 TELEOP_ID    = os.environ.get("TELEOP_ID",   "leader_arm")
 
+# Camera config — indices must match your physical setup (see webcam_stream.py)
+CAM_HIGH_INDEX = int(os.environ.get("CAM_HIGH_INDEX", "0"))   # overview / stationary
+CAM_LOW_INDEX  = int(os.environ.get("CAM_LOW_INDEX",  "2"))   # follower side
+CAM_WIDTH      = int(os.environ.get("CAM_WIDTH",  "640"))
+CAM_HEIGHT     = int(os.environ.get("CAM_HEIGHT", "480"))
+CAM_FPS        = int(os.environ.get("CAM_FPS",    "30"))
+
 TRACE_FILE   = Path(STORAGE_DIR) / "trace.jsonl"
 SKILLS_DIR   = Path(STORAGE_DIR) / "skills"
 
@@ -152,6 +159,17 @@ def _record_episode(
         f"--dataset.num_episodes={num_episodes}",
         f"--dataset.episode_time_s={episode_time_s}",
         f"--dataset.reset_time_s={reset_time_s}",
+        # Camera config — records MP4 alongside parquet
+        "--robot.cameras.cam_high.type=opencv",
+        f"--robot.cameras.cam_high.index={CAM_HIGH_INDEX}",
+        f"--robot.cameras.cam_high.width={CAM_WIDTH}",
+        f"--robot.cameras.cam_high.height={CAM_HEIGHT}",
+        f"--robot.cameras.cam_high.fps={CAM_FPS}",
+        "--robot.cameras.cam_low.type=opencv",
+        f"--robot.cameras.cam_low.index={CAM_LOW_INDEX}",
+        f"--robot.cameras.cam_low.width={CAM_WIDTH}",
+        f"--robot.cameras.cam_low.height={CAM_HEIGHT}",
+        f"--robot.cameras.cam_low.fps={CAM_FPS}",
     ]
     if root is not None:
         cmd += [f"--dataset.root={root}"]
