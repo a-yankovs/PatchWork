@@ -344,12 +344,18 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
         config["dataset"]["repo_ids"],
         config["dataset"]["roots"]
     ):
+        full_path = str(Path(root) / repo_id)
         try:
-            ds = LeRobotDataset(repo_id=repo_id, root=root)
+            # Try local-only load with full path as root (LeRobot v2)
+            try:
+                ds = LeRobotDataset(repo_id=repo_id, root=full_path, local_files_only=True)
+            except TypeError:
+                # local_files_only not supported in this version — use root only
+                ds = LeRobotDataset(repo_id=repo_id, root=full_path)
             datasets.append(ds)
             logger.info(f"  Loaded dataset: {repo_id} ({len(ds)} frames)")
         except Exception as ex:
-            logger.warning(f"  Could not load {repo_id}: {ex}")
+            logger.warning(f"  Could not load {repo_id} from {full_path}: {ex}")
 
     if not datasets:
         logger.error("No datasets could be loaded. Check dataset paths.")
@@ -564,7 +570,9 @@ def resolve_device(device_arg: str) -> str:
     try:
         import torch
         if torch.cuda.is_available():
-            # Check for ROCm (AMD) — torch.cuda works with ROCm too
+            return "cuda"
+        # Explicit ROCm check — HIP version present means AMD GPU is available
+        if getattr(torch.version, "hip", None) is not None:
             return "cuda"
     except ImportError:
         pass
