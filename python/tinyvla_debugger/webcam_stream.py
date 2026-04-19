@@ -106,12 +106,39 @@ class WebcamStream:
 
         # Flush a few warm-up frames so the background thread starts from
         # a valid frame rather than whatever stale buffer the driver has.
+        # Also check mean brightness — a camera that opens but returns only
+        # black frames (mean < _BLACK_FRAME_THRESHOLD) is treated as dead
+        # so main.py can fall back to a grey placeholder for that stream.
+        _BLACK_FRAME_THRESHOLD = 5.0  # mean pixel value 0-255; <5 ≈ completely black
+
+        bright_frames = 0
         for _ in range(5):
             ret, frame = self._cap.read()
             if ret:
                 self._frame = frame
-        if self._frame is not None:
-            logger.debug("WebcamStream: warm-up frames flushed (device %d)", self.index)
+                mean_val = float(np.mean(frame))
+                if mean_val > _BLACK_FRAME_THRESHOLD:
+                    bright_frames += 1
+
+        if self._frame is None:
+            self._cap.release()
+            raise RuntimeError(
+                f"WebcamStream: device {self.index} opened but returned no frames. "
+                "Check the camera connection."
+            )
+
+        if bright_frames == 0:
+            self._cap.release()
+            raise RuntimeError(
+                f"WebcamStream: device {self.index} opened but all warmup frames are "
+                f"black (mean < {_BLACK_FRAME_THRESHOLD}). "
+                "Camera may be blocked, covered, or the wrong device index."
+            )
+
+        logger.debug(
+            "WebcamStream: warm-up OK — %d/%d bright frames (device %d)",
+            bright_frames, 5, self.index,
+        )
 
         self._running = True
         self._thread = threading.Thread(

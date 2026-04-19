@@ -105,7 +105,14 @@ SKILL_MANIFESTS = {
     },
 
     "box_in_shelf": {
-        "description": "Pick up a box and place it upright in an empty shelf slot.",
+        # NOTE: pick_object is NOT listed here.
+        # The orchestrator compiles "box_in_shelf" as two steps:
+        #   step 0 → pick_object manifest  (handled separately by the compiler)
+        #   step 1 → box_in_shelf manifest (this file — placement only)
+        # Having pick_object in this manifest caused the arm to attempt a second
+        # pick during the shelf run, hitting the motor overload before
+        # ever reaching place_in_shelf. Fixed 2026-04-18.
+        "description": "Place a box already held in the gripper upright into an empty shelf slot.",
         "default_params": {
             "z_offset_mm": 0.0,
             "speed_scale": 0.8,
@@ -114,13 +121,6 @@ SKILL_MANIFESTS = {
             "retry_count": 2,
         },
         "steps": [
-            {
-                "name": "pick_object",
-                "dataset_repo_id": f"{DATA_DIR}/pick_object_v5",
-                "verification_query": "Is a box held securely in the gripper?",
-                "expected_result": True,
-                "description": "Pick the box.",
-            },
             {
                 "name": "move_box_to_shelf",
                 "dataset_repo_id": f"{DATA_DIR}/place_in_shelf",
