@@ -102,22 +102,40 @@ def dataset_exists(path: str) -> bool:
     p = Path(path)
     if not p.exists():
         return False
-    # LeRobot stores data in data/chunk-*/episode_*.parquet
-    has_parquet = any(p.rglob("episode_*.parquet"))
-    # Or in meta/episodes.jsonl
-    has_meta = (p / "meta" / "episodes.jsonl").exists()
-    return has_parquet or has_meta
+    # LeRobot v2 format: data/chunk-*/file-*.parquet
+    has_parquet_v2 = any(p.glob("data/chunk-*/file-*.parquet"))
+    # LeRobot v1 format: data/chunk-*/episode_*.parquet
+    has_parquet_v1 = any(p.rglob("episode_*.parquet"))
+    # meta/info.json is always present in valid datasets
+    has_meta = (p / "meta" / "info.json").exists()
+    return has_meta or has_parquet_v2 or has_parquet_v1
 
 
 def count_episodes(path: str) -> int:
     p = Path(path)
-    episodes = set()
-    for f in p.rglob("episode_*.parquet"):
+    # LeRobot v2: read total_episodes from meta/info.json
+    info = p / "meta" / "info.json"
+    if info.exists():
         try:
-            idx = int(f.stem.split("_")[-1])
-            episodes.add(idx)
+            return json.loads(info.read_text(encoding="utf-8")).get("total_episodes", 0)
+        except Exception:
+            pass
+    # LeRobot v2: count file-*.parquet in data/chunk-*/
+    episodes = set()
+    for f in p.glob("data/chunk-*/file-*.parquet"):
+        try:
+            episodes.add(f.stem)
         except ValueError:
             pass
+    if episodes:
+        return len(episodes)
+    # LeRobot v1 fallback: episode_*.parquet
+    for f in p.rglob("episode_*.parquet"):
+        try:
+            episodes.add(int(f.stem.split("_")[-1]))
+        except ValueError:
+            pass
+    # meta/episodes.jsonl fallback
     if not episodes:
         meta = p / "meta" / "episodes.jsonl"
         if meta.exists():
