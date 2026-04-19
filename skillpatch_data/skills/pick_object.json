@@ -1,0 +1,21 @@
+{
+  "skill_name": "pick_object",
+  "description": "Pick an object from the scene into the gripper.",
+  "steps": [
+    {
+      "step_id": 0,
+      "name": "pick_object",
+      "dataset_repo_id": "./data/pick_object_v5",
+      "verification_query": "Is an object held securely in the gripper?",
+      "expected_result": true,
+      "description": "Pick the object \u2014 best recording is v5."
+    }
+  ],
+  "default_params": {
+    "z_offset_mm": 0.0,
+    "speed_scale": 1.0,
+    "approach_angle_deg": 0.0,
+    "gripper_close_force": 0.6,
+    "retry_count": 2
+  }
+}

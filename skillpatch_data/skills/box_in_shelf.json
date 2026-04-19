@@ -1,0 +1,21 @@
+{
+  "skill_name": "box_in_shelf",
+  "description": "Place a box already held in the gripper upright into an empty shelf slot.",
+  "steps": [
+    {
+      "step_id": 0,
+      "name": "move_box_to_shelf",
+      "dataset_repo_id": "./data/place_in_shelf",
+      "verification_query": "Is a box standing upright in the shelf slot?",
+      "expected_result": true,
+      "description": "Place the box upright into the shelf slot."
+    }
+  ],
+  "default_params": {
+    "z_offset_mm": 0.0,
+    "speed_scale": 0.8,
+    "approach_angle_deg": 0.0,
+    "gripper_close_force": 0.7,
+    "retry_count": 2
+  }
+}
