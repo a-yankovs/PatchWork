@@ -467,6 +467,18 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
 
     policy = policy.to(device)
 
+    # Monkey-patch: ACT stacks state token with image tokens and expects all
+    # to be 3-D (batch, seq, dim). The state projection outputs (batch, dim)
+    # 2-D while image tokens are (batch, 1, dim). Wrap the projection to add
+    # the missing sequence dimension so torch.stack doesn't complain.
+    _orig_proj = policy.model.encoder_robot_state_input_proj
+    def _patched_proj(x):
+        out = _orig_proj(x)
+        if out.dim() == 2:
+            out = out.unsqueeze(1)   # (B, dim) → (B, 1, dim)
+        return out
+    policy.model.encoder_robot_state_input_proj = _patched_proj
+
     # ---- Optimiser ---------------------------------------------------------
     backbone_params = []
     other_params    = []
