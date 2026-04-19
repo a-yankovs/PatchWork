@@ -383,9 +383,9 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
     pc = config["policy"]
     policy_cfg = ACTConfig(
         chunk_size              = pc["chunk_size"],
-        n_action_steps          = pc["n_action_steps"],
+        n_action_steps          = pc["chunk_size"],  # must equal chunk_size when not ensembling
         n_obs_steps             = pc["n_obs_steps"],
-        temporal_ensemble_coeff = pc["temporal_ensemble_coeff"],
+        temporal_ensemble_coeff = None,              # disable ensembling during training
         vision_backbone         = pc["vision_backbone"],
         pretrained_backbone_weights = pc["pretrained_backbone_weights"],
         dim_model               = pc["dim_model"],
@@ -571,9 +571,15 @@ def resolve_device(device_arg: str) -> str:
         import torch
         if torch.cuda.is_available():
             return "cuda"
-        # Explicit ROCm check — HIP version present means AMD GPU is available
+        # ROCm check — HIP version present means AMD GPU available
         if getattr(torch.version, "hip", None) is not None:
             return "cuda"
+        # Last resort: try creating a cuda tensor directly
+        try:
+            torch.zeros(1).cuda()
+            return "cuda"
+        except Exception:
+            pass
     except ImportError:
         pass
     return "cpu"
