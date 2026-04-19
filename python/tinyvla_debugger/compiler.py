@@ -77,7 +77,7 @@ SKILL_PROGRAM_SCHEMA = {
 
 _DEFAULT_PARAMS = {
     "z_offset_mm": 0.0,
-    "speed_scale": 1.0,
+    "speed_scale": 0.5,
     "approach_angle_deg": 0.0,
     "gripper_close_force": 0.6,
     "retry_count": 2,
