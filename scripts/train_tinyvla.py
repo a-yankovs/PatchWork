@@ -409,7 +409,7 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
         cam_key_names = [p.name for p in cam_keys if p.is_dir()]
 
         input_features = {
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(1, 6)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
         }
         for cam in cam_key_names:
             input_features[cam] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640))
@@ -512,6 +512,14 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
             # Move to device
             batch = {k: v.to(device) if hasattr(v, "to") else v
                      for k, v in batch.items()}
+
+            # ACT expects observation.state as (batch, n_obs_steps, state_dim)
+            # Dataset returns (batch, state_dim) — add the time dimension
+            if "observation.state" in batch and batch["observation.state"].dim() == 2:
+                batch["observation.state"] = batch["observation.state"].unsqueeze(1)
+            # Same for action — ACT expects (batch, chunk_size, action_dim)
+            if "action" in batch and batch["action"].dim() == 2:
+                batch["action"] = batch["action"].unsqueeze(1)
 
             optimizer.zero_grad()
             loss, loss_dict = policy.forward(batch)
