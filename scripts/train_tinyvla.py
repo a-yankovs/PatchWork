@@ -469,15 +469,21 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
 
     # Monkey-patch: ACT stacks state token with image tokens and expects all
     # to be 3-D (batch, seq, dim). The state projection outputs (batch, dim)
-    # 2-D while image tokens are (batch, 1, dim). Wrap the projection to add
-    # the missing sequence dimension so torch.stack doesn't complain.
-    _orig_proj = policy.model.encoder_robot_state_input_proj
-    def _patched_proj(x):
-        out = _orig_proj(x)
-        if out.dim() == 2:
-            out = out.unsqueeze(1)   # (B, dim) → (B, 1, dim)
-        return out
-    policy.model.encoder_robot_state_input_proj = _patched_proj
+    # 2-D while image tokens are (batch, 1, dim). Wrap the projection in a
+    # proper nn.Module so PyTorch's __setattr__ accepts it.
+    import torch.nn as nn
+    class _UnsqueezeWrapper(nn.Module):
+        def __init__(self, inner: nn.Module):
+            super().__init__()
+            self.inner = inner
+        def forward(self, x):
+            out = self.inner(x)
+            if out.dim() == 2:
+                out = out.unsqueeze(1)   # (B, dim) → (B, 1, dim)
+            return out
+    policy.model.encoder_robot_state_input_proj = _UnsqueezeWrapper(
+        policy.model.encoder_robot_state_input_proj
+    )
 
     # ---- Optimiser ---------------------------------------------------------
     backbone_params = []
