@@ -513,20 +513,17 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
             batch = {k: v.to(device) if hasattr(v, "to") else v
                      for k, v in batch.items()}
 
-            # ACT expects observation.state as (batch, n_obs_steps, state_dim)
-            # Dataset returns (batch, state_dim) — add the time dimension
-            if "observation.state" in batch and batch["observation.state"].dim() == 2:
-                batch["observation.state"] = batch["observation.state"].unsqueeze(1)
-            # Same for action — ACT expects (batch, chunk_size, action_dim)
-            if "action" in batch and batch["action"].dim() == 2:
-                batch["action"] = batch["action"].unsqueeze(1)
-            # delta_timestamps adds a T=1 time dimension to camera images:
-            # [B, 1, C, H, W] — ACT's ResNet backbone expects [B, C, H, W].
-            # Squeeze out the T dim so all encoder tokens end up 2-D [B, hidden]
-            # and torch.stack inside ACT doesn't see a shape mismatch.
+            # delta_timestamps wraps every observation in a T=1 time dim.
+            # ACT's encoder expects flat 2-D tokens — squeeze T=1 out of
+            # state [B,1,state_dim]→[B,state_dim] and cameras [B,1,C,H,W]→[B,C,H,W].
+            if "observation.state" in batch and batch["observation.state"].dim() == 3:
+                batch["observation.state"] = batch["observation.state"].squeeze(1)
             for k in list(batch.keys()):
                 if k.startswith("observation.images.") and batch[k].dim() == 5:
                     batch[k] = batch[k].squeeze(1)  # [B,1,C,H,W] → [B,C,H,W]
+            # Action must stay 3-D for ACT's chunk loss: [B, chunk_size, action_dim]
+            if "action" in batch and batch["action"].dim() == 2:
+                batch["action"] = batch["action"].unsqueeze(1)
 
             optimizer.zero_grad()
             loss, loss_dict = policy.forward(batch)
