@@ -41,7 +41,7 @@ SKILL_MANIFESTS = {
         "description": "Pick an object from the scene into the gripper.",
         "default_params": {
             "z_offset_mm": 0.0,
-            "speed_scale": 1.0,
+            "speed_scale": 0.5,
             "approach_angle_deg": 0.0,
             "gripper_close_force": 0.6,
             "retry_count": 2,
@@ -61,7 +61,7 @@ SKILL_MANIFESTS = {
         "description": "Place the object currently held in the gripper into the target box.",
         "default_params": {
             "z_offset_mm": 0.0,
-            "speed_scale": 1.0,
+            "speed_scale": 0.5,
             "approach_angle_deg": 0.0,
             "gripper_close_force": 0.6,
             "retry_count": 2,
@@ -81,7 +81,7 @@ SKILL_MANIFESTS = {
         "description": "Pick an object from the scene and place it into the target box.",
         "default_params": {
             "z_offset_mm": 0.0,
-            "speed_scale": 1.0,
+            "speed_scale": 0.5,
             "approach_angle_deg": 0.0,
             "gripper_close_force": 0.6,
             "retry_count": 2,
@@ -115,7 +115,7 @@ SKILL_MANIFESTS = {
         "description": "Place a box already held in the gripper upright into an empty shelf slot.",
         "default_params": {
             "z_offset_mm": 0.0,
-            "speed_scale": 0.8,
+            "speed_scale": 0.6,
             "approach_angle_deg": 0.0,
             "gripper_close_force": 0.7,
             "retry_count": 2,

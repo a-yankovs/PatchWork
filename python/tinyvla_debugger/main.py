@@ -77,11 +77,16 @@ def _build_orchestrator(
         teleop_id=teleop_id,
         storage_dir=storage_dir,
     )
+    import os
     return Orchestrator(
         robot=robot,
         compiler_backend=compiler_backend,
         webcam_index=webcam_index,
         frame_source=frame_source,
+        # Point PatchLibrary at the same file RobotAPI uses so patches
+        # learned in one run are loaded on the next run.
+        patches_file=os.path.join(storage_dir, "patches.json"),
+        trace_file=os.path.join(storage_dir, "trace.jsonl"),
         # AudioFeedback() default: reads ELEVENLABS_API_KEY from env
     )
 
