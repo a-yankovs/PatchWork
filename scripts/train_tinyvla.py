@@ -409,7 +409,7 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
         cam_key_names = [p.name for p in cam_keys if p.is_dir()]
 
         input_features = {
-            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(1, 6)),
         }
         for cam in cam_key_names:
             input_features[cam] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640))
