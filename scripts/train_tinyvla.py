@@ -302,8 +302,8 @@ def run_lerobot_train(config: dict, dry_run: bool) -> None:
         except FileNotFoundError:
             continue
         except subprocess.CalledProcessError as e:
-            logger.error(f"Command failed: {' '.join(cmd)}\n  Exit code: {e.returncode}")
-            sys.exit(1)
+            logger.warning(f"Command failed: {' '.join(cmd)}\n  Exit code: {e.returncode} — trying native loop")
+            break
 
     # Neither worked — fall back to native Python training
     logger.warning("lerobot-train CLI not found. Attempting native Python training...")
@@ -321,9 +321,15 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
     """
     try:
         import torch
-        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-        from lerobot.common.policies.act.modeling_act import ACTPolicy
-        from lerobot.common.policies.act.configuration_act import ACTConfig
+        # Try LeRobot v2 paths first, fall back to v1
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            from lerobot.policies.act.modeling_act import ACTPolicy
+            from lerobot.policies.act.configuration_act import ACTConfig
+        except ImportError:
+            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+            from lerobot.common.policies.act.modeling_act import ACTPolicy
+            from lerobot.common.policies.act.configuration_act import ACTConfig
     except ImportError as e:
         print(f"\nERROR: Cannot import LeRobot: {e}")
         print("Install LeRobot: pip install git+https://github.com/huggingface/lerobot")
