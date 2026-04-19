@@ -117,22 +117,53 @@ class _CameraServer:
     def _open_sync(self) -> None:
         new_handles = []
         for idx in CAMERA_INDICES:
-            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                cap.set(cv2.CAP_PROP_FPS, 30)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                new_handles.append(cap)
-            else:
-                cap.release()
-                new_handles.append(None)
+            cap = self._try_open(idx)
+            new_handles.append(cap)
         with self._lock:
             for cap in self._handles:
                 if cap:
                     cap.release()
             self._handles = new_handles
+
+    @staticmethod
+    def _try_open(idx: int) -> "cv2.VideoCapture | None":
+        """
+        Open a camera at device index, verify it actually delivers non-black frames.
+
+        Tries CAP_V4L2 first, then CAP_ANY as fallback.
+        Returns None if the device won't open or only delivers black frames.
+        """
+        _BLACK_THRESHOLD = 5.0  # mean pixel value; <5 = effectively black
+
+        for backend in (cv2.CAP_V4L2, cv2.CAP_ANY):
+            cap = cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            # Flush up to 10 warmup frames and check brightness.
+            # A device that opens but delivers only black frames is treated as dead.
+            bright = 0
+            for _ in range(10):
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    if float(np.mean(frame)) > _BLACK_THRESHOLD:
+                        bright += 1
+
+            if bright > 0:
+                return cap   # good camera
+
+            cap.release()
+            # don't bother trying CAP_ANY if V4L2 opened but was black — same HW
+            break
+
+        return None
 
     def close(self) -> None:
         with self._lock:
@@ -158,17 +189,11 @@ class _CameraServer:
                         if idx >= len(self._handles):
                             continue
                         if self._handles[idx] is None:
-                            # Try to reconnect
-                            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-                            if cap.isOpened():
-                                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-                                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                                cap.set(cv2.CAP_PROP_FPS, 30)
-                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            # Try to reconnect using the same validated open
+                            device_idx = CAMERA_INDICES[idx]
+                            cap = _CameraServer._try_open(device_idx)
+                            if cap is not None:
                                 self._handles[idx] = cap
-                            else:
-                                cap.release()
         
         self._health_check_thread = threading.Thread(target=health_check_loop, daemon=True)
         self._health_check_thread.start()
@@ -618,8 +643,86 @@ def camera_feeds() -> None:
         )
 
 
+def camera_scanner() -> None:
+    """
+    Sidebar tool: scan all /dev/video* devices and show one snapshot from each.
+    Lets you figure out which device index maps to which physical camera.
+    """
+    with st.sidebar:
+        st.markdown("### Camera Scanner")
+        st.markdown(
+            "<p style='color:#8892A4; font-size:0.8rem;'>"
+            "Scan every /dev/video* device and show what it sees. "
+            "Use this to find the right index for each physical camera.</p>",
+            unsafe_allow_html=True,
+        )
+        if st.button("Scan cameras now"):
+            import glob
+            device_nodes = sorted(glob.glob("/dev/video*"))
+            # Only even-numbered nodes are capture devices on most Linux kernels
+            # (odd nodes are the metadata companion device).
+            indices = []
+            for node in device_nodes:
+                try:
+                    idx = int(node.replace("/dev/video", ""))
+                    if idx % 2 == 0:   # skip metadata nodes (video1, video3, …)
+                        indices.append(idx)
+                except ValueError:
+                    pass
+
+            if not indices:
+                st.warning("No /dev/video* devices found.")
+                return
+
+            st.markdown(f"Found {len(indices)} capture device(s): {indices}")
+
+            for idx in indices:
+                cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                if not cap.isOpened():
+                    cap.release()
+                    cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
+
+                if not cap.isOpened():
+                    st.markdown(f"**device {idx}** — failed to open")
+                    cap.release()
+                    continue
+
+                # Flush a few frames then grab one
+                frame = None
+                mean_val = 0.0
+                for _ in range(8):
+                    ret, f = cap.read()
+                    if ret and f is not None:
+                        frame = f
+                        mean_val = float(np.mean(f))
+                cap.release()
+
+                if frame is None:
+                    status = "opened but no frames"
+                    st.markdown(f"**device {idx}** — {status}")
+                elif mean_val < 5.0:
+                    status = f"⚫ black frames (mean={mean_val:.1f}) — wrong device or blocked"
+                    st.markdown(f"**device {idx}** — {status}")
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    st.image(frame_rgb, caption=f"device {idx} (black)", width=200)
+                else:
+                    status = f"✓ live  (mean brightness={mean_val:.1f})"
+                    st.markdown(f"**device {idx}** — {status}")
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    st.image(frame_rgb, caption=f"device {idx}", width=200)
+
+        st.markdown("---")
+        st.markdown(
+            "<p style='color:#8892A4; font-size:0.78rem;'>"
+            "Current config: <code>CAMERA_INDICES = " + str(CAMERA_INDICES) + "</code><br/>"
+            "Edit <code>CAMERA_INDICES</code> at the top of dashboard.py to change.</p>",
+            unsafe_allow_html=True,
+        )
+
+
 if "session_start" not in st.session_state:
     st.session_state.session_start = datetime.now().timestamp()
 
+camera_scanner()
 camera_feeds()
 live_dashboard()
