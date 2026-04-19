@@ -467,24 +467,6 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
 
     policy = policy.to(device)
 
-    # Monkey-patch: ACT stacks state token with image tokens and expects all
-    # to be 3-D (batch, seq, dim). The state projection outputs (batch, dim)
-    # 2-D while image tokens are (batch, 1, dim). Wrap the projection in a
-    # proper nn.Module so PyTorch's __setattr__ accepts it.
-    import torch.nn as nn
-    class _UnsqueezeWrapper(nn.Module):
-        def __init__(self, inner: nn.Module):
-            super().__init__()
-            self.inner = inner
-        def forward(self, x):
-            out = self.inner(x)
-            if out.dim() == 2:
-                out = out.unsqueeze(1)   # (B, dim) → (B, 1, dim)
-            return out
-    policy.model.encoder_robot_state_input_proj = _UnsqueezeWrapper(
-        policy.model.encoder_robot_state_input_proj
-    )
-
     # ---- Optimiser ---------------------------------------------------------
     backbone_params = []
     other_params    = []
@@ -538,6 +520,13 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
             # Same for action — ACT expects (batch, chunk_size, action_dim)
             if "action" in batch and batch["action"].dim() == 2:
                 batch["action"] = batch["action"].unsqueeze(1)
+            # delta_timestamps adds a T=1 time dimension to camera images:
+            # [B, 1, C, H, W] — ACT's ResNet backbone expects [B, C, H, W].
+            # Squeeze out the T dim so all encoder tokens end up 2-D [B, hidden]
+            # and torch.stack inside ACT doesn't see a shape mismatch.
+            for k in list(batch.keys()):
+                if k.startswith("observation.images.") and batch[k].dim() == 5:
+                    batch[k] = batch[k].squeeze(1)  # [B,1,C,H,W] → [B,C,H,W]
 
             optimizer.zero_grad()
             loss, loss_dict = policy.forward(batch)
