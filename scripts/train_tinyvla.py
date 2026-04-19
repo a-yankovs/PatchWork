@@ -381,23 +381,65 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
 
     # ---- Policy ------------------------------------------------------------
     pc = config["policy"]
-    policy_cfg = ACTConfig(
-        chunk_size              = pc["chunk_size"],
-        n_action_steps          = pc["chunk_size"],  # must equal chunk_size when not ensembling
-        n_obs_steps             = pc["n_obs_steps"],
-        temporal_ensemble_coeff = None,              # disable ensembling during training
-        vision_backbone         = pc["vision_backbone"],
-        pretrained_backbone_weights = pc["pretrained_backbone_weights"],
-        dim_model               = pc["dim_model"],
-        n_heads                 = pc["n_heads"],
-        dim_feedforward         = pc["dim_feedforward"],
-        n_encoder_layers        = pc["n_encoder_layers"],
-        n_decoder_layers        = pc["n_decoder_layers"],
-        use_vae                 = pc["use_vae"],
-        latent_dim              = pc["latent_dim"],
-        n_vae_encoder_layers    = pc["n_vae_encoder_layers"],
-        kl_weight               = pc["kl_weight"],
-    )
+
+    # Build input/output features from dataset — state-only (no cameras in these datasets)
+    try:
+        from lerobot.configs.types import FeatureType, PolicyFeature
+
+        # Auto-detect cameras from first dataset's videos/ directory
+        first_ds_path = Path(config["dataset"]["roots"][0]) / config["dataset"]["repo_ids"][0]
+        videos_dir = first_ds_path / "videos"
+        cam_keys = sorted(videos_dir.iterdir()) if videos_dir.exists() else []
+        cam_key_names = [p.name for p in cam_keys if p.is_dir()]
+
+        input_features = {
+            "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+        }
+        for cam in cam_key_names:
+            input_features[cam] = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640))
+
+        if cam_key_names:
+            logger.info(f"  Cameras detected: {cam_key_names}")
+        else:
+            logger.info("  No cameras detected — training on joint state only")
+
+        output_features = {
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+        }
+        policy_cfg = ACTConfig(
+            input_features          = input_features,
+            output_features         = output_features,
+            chunk_size              = pc["chunk_size"],
+            n_action_steps          = pc["chunk_size"],
+            n_obs_steps             = pc["n_obs_steps"],
+            temporal_ensemble_coeff = None,
+            dim_model               = pc["dim_model"],
+            n_heads                 = pc["n_heads"],
+            dim_feedforward         = pc["dim_feedforward"],
+            n_encoder_layers        = pc["n_encoder_layers"],
+            n_decoder_layers        = pc["n_decoder_layers"],
+            use_vae                 = pc["use_vae"],
+            latent_dim              = pc["latent_dim"],
+            n_vae_encoder_layers    = pc["n_vae_encoder_layers"],
+            kl_weight               = pc["kl_weight"],
+        )
+    except (ImportError, TypeError):
+        # Older LeRobot — no input_features param, use state_dim instead
+        policy_cfg = ACTConfig(
+            chunk_size              = pc["chunk_size"],
+            n_action_steps          = pc["chunk_size"],
+            n_obs_steps             = pc["n_obs_steps"],
+            temporal_ensemble_coeff = None,
+            dim_model               = pc["dim_model"],
+            n_heads                 = pc["n_heads"],
+            dim_feedforward         = pc["dim_feedforward"],
+            n_encoder_layers        = pc["n_encoder_layers"],
+            n_decoder_layers        = pc["n_decoder_layers"],
+            use_vae                 = pc["use_vae"],
+            latent_dim              = pc["latent_dim"],
+            n_vae_encoder_layers    = pc["n_vae_encoder_layers"],
+            kl_weight               = pc["kl_weight"],
+        )
 
     # Resume or create fresh
     resume_from = config["training"].get("resume_from")
