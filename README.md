@@ -1,4 +1,4 @@
-# PatchWork -- Self-Healing Robot Execution Layer
+# PatchWork: Self-Healing Robot Execution Layer
 
 **PatchWork** is a real-time failure detection and skill correction system for the WOWROBO SO-ARM101 robotic arm, built at StarkHacks 2026. It wraps LeRobot skill execution with a 7-layer pipeline that detects failures mid-task, classifies the cause, applies a learned patch, and retries. Operators monitor the system through a live dashboard and can intervene or re-trigger skills at any point.
 
@@ -65,5 +65,7 @@ Set `ELEVENLABS_API_KEY` for audio feedback. For AMD ROCm GPU inference, install
 ---
 
 ## Team
+
+**Alexandra Yankovskaya, Vera Chuang, Diya Bengani, Elias Assalif**
 
 Built at StarkHacks 2026, targeting AMD Pervasive AI, Microsoft Azure, robotics, and startup prize tracks.
