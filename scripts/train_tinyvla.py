@@ -86,10 +86,10 @@ TASK_DESCRIPTION = (
 # ---------------------------------------------------------------------------
 
 DEFAULT_OUTPUT_DIR    = "checkpoints/tinyvla_pick_and_place"
-DEFAULT_EPOCHS        = 100
-DEFAULT_BATCH_SIZE    = 8
+DEFAULT_EPOCHS        = 20
+DEFAULT_BATCH_SIZE    = 16
 DEFAULT_LR            = 1e-4
-DEFAULT_CHUNK_SIZE    = 50      # ACT action chunk horizon (50 steps @ 50Hz = 1 second)
+DEFAULT_CHUNK_SIZE    = 20      # ACT action chunk horizon (20 steps @ 50Hz = 0.4 seconds)
 DEFAULT_CHUNK_WEIGHT  = 0.1     # ACT temporal ensemble weight
 DEFAULT_SEED          = 42
 
