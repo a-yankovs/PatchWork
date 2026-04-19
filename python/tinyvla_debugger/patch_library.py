@@ -265,7 +265,7 @@ class PatchLibrary:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Inspect SkillPatch patch library")
+    parser = argparse.ArgumentParser(description="Inspect PatchWork patch library")
     parser.add_argument("--file", default=_DEFAULT_PATCHES_FILE, help="patches.json path")
     parser.add_argument("--clear", action="store_true", help="Clear all entries")
     parser.add_argument("--seed", action="store_true", help="Show default patches")

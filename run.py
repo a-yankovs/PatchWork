@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run.py — One-command entry point for the SkillPatch tinyVLA pipeline.
+run.py — One-command entry point for the PatchWork tinyVLA pipeline.
 
 Full pipeline:
   Voice command (STT) → SLM compiler → webcam stream → VLM verifier → robot

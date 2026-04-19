@@ -1,5 +1,5 @@
 # The purpose of this script is to generate a realistic execution trace for dashboard testing
-# without requiring the physical robot or VLM. It simulates the full SkillPatch story:
+# without requiring the physical robot or VLM. It simulates the full PatchWork story:
 # failure on first run, autonomous patch applied, clean runs on all subsequent attempts.
 
 import argparse
@@ -140,7 +140,7 @@ def run_demo(runs: int = 5, step_delay: float = 1.5) -> None:
 
     fail_schedule = [1, 2] + [-1] * max(0, runs - 2)
 
-    print("\nSkillPatch trace simulator")
+    print("\nPatchWork trace simulator")
     print(f"Runs: {runs}   Step delay: {step_delay}s")
     print("Dashboard: python -m streamlit run dashboard.py\n")
 
@@ -163,7 +163,7 @@ def run_demo(runs: int = 5, step_delay: float = 1.5) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SkillPatch trace simulator")
+    parser = argparse.ArgumentParser(description="PatchWork trace simulator")
     parser.add_argument("--runs",   type=int,   default=5,   help="number of skill runs")
     parser.add_argument("--delay",  type=float, default=1.5, help="seconds between steps")
     parser.add_argument("--single", action="store_true",     help="one run, failure at step 1")

@@ -78,7 +78,7 @@ def _error_text(failure_type: str, step_id: int, skill_name: str) -> str:
 
 class AudioFeedback:
     """
-    ElevenLabs TTS wrapper for SkillPatch event audio cues.
+    ElevenLabs TTS wrapper for PatchWork event audio cues.
 
     Falls back to a console-only mock if:
       - `enabled=False` is passed

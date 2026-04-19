@@ -1,5 +1,5 @@
 """
-main.py — SkillPatch unified pipeline entry point
+main.py — PatchWork unified pipeline entry point
 Owner: Vera
 
 Ties together the full workflow:
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 _BANNER = """
 ╔═══════════════════════════════════════════════════════════╗
-║             SkillPatch — tinyVLA Robot Pipeline           ║
+║             PatchWork — tinyVLA Robot Pipeline           ║
 ║                                                           ║
 ║  [STT] → [SLM compiler] → [VLM verify] → [SLM classify]  ║
 ╚═══════════════════════════════════════════════════════════╝"""
@@ -276,7 +276,7 @@ async def _main_async(args: argparse.Namespace) -> None:
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="tinyvla",
-        description="SkillPatch tinyVLA unified pipeline",
+        description="PatchWork tinyVLA unified pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

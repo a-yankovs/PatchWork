@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 robot_api.py
 
-Clean robot execution interface for the SkillPatch project.
+Clean robot execution interface for the PatchWork project.
 
 Wraps LeRobot CLI workflows behind a small Python API the orchestrator
 can call without needing raw terminal commands.
@@ -91,7 +91,7 @@ class StepEvent:
 # ── Main API ──────────────────────────────────────────────────────────────────
 
 class RobotAPI:
-    """High-level LeRobot wrapper for SkillPatch.
+    """High-level LeRobot wrapper for PatchWork.
 
     Public interface for the orchestrator:
         record_skill(...)

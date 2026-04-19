@@ -1,5 +1,5 @@
 """
-tinyvla_debugger — SkillPatch: Self-Healing Robot Execution Layer
+tinyvla_debugger — PatchWork: Self-Healing Robot Execution Layer
 
 Pipeline entry point:
   run.py (project root) — one command to run everything

@@ -1,5 +1,5 @@
 """
-orchestrator.py — Central control loop (SkillPatch state machine)
+orchestrator.py — Central control loop (PatchWork state machine)
 Owner: Vera
 
 The orchestrator is the only component that calls all other layers.
@@ -124,7 +124,7 @@ class SkillResult:
 
 class Orchestrator:
     """
-    Central control loop for SkillPatch.
+    Central control loop for PatchWork.
 
     Args:
         robot:            RobotAPI implementation. Defaults to importing
@@ -731,7 +731,7 @@ async def _main(command: str, mock: bool = False) -> None:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="SkillPatch orchestrator")
+    parser = argparse.ArgumentParser(description="PatchWork orchestrator")
     parser.add_argument("command", nargs="?",
                         default="Put the canned goods on the middle shelf")
     parser.add_argument("--mock", action="store_true",

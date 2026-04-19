@@ -1,5 +1,5 @@
 <<<<<<< HEAD
-# SkillPatch dependencies
+# PatchWork dependencies
 # Install with: pip install -r requirements.txt
 
 # Dashboard
@@ -22,7 +22,7 @@ onnxruntime>=1.17.0
 # Dev
 pytest>=7.4.0
 =======
-# SkillPatch — Python dependencies
+# PatchWork — Python dependencies
 # Install: pip install -r requirements.txt --break-system-packages
 #
 # Hardware-specific packages (AMD ROCm GPU):

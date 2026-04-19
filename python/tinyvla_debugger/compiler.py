@@ -718,7 +718,7 @@ if __name__ == "__main__":
     import sys
     import argparse
 
-    parser = argparse.ArgumentParser(description="SkillPatch NL compiler")
+    parser = argparse.ArgumentParser(description="PatchWork NL compiler")
     parser.add_argument("command", nargs="?", default="Put the canned goods on the middle shelf")
     parser.add_argument("--backend", default="auto", choices=["auto", "llama_cpp", "onnx_rocm", "mock"])
     parser.add_argument("--model-path", default=None)

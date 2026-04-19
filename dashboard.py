@@ -1,4 +1,4 @@
-# The purpose of this module is to provide a live view of the SkillPatch execution state.
+# The purpose of this module is to provide a live view of the PatchWork execution state.
 # It reads trace.jsonl and patches.json every 500ms and displays robot step status,
 # the ReAct agentic loop phase, NPU vs CPU latency, execution history, and patch memory.
 
@@ -400,7 +400,7 @@ def get_active_react_phases(events: list[dict]) -> set[str]:
     return {"PLAN"}
 
 
-st.set_page_config(page_title="SkillPatch", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="PatchWork", page_icon="🦾", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -476,7 +476,7 @@ col_title, col_badge = st.columns([3, 1])
 with col_title:
     st.markdown("""
 <h1 style='margin:0; font-size:1.9rem; letter-spacing:-0.5px; font-family: Space Grotesk, sans-serif;'>
-    <span style='color:#ED1C24;'>Skill</span>Patch
+    <span style='color:#ED1C24;'>Patch</span>Work
 </h1>
 <p style='color:#8892A4; margin:1px 0 0 0; font-size:0.85rem;'>
     Self-Healing Robot Execution Layer
