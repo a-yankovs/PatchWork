@@ -89,7 +89,7 @@ DEFAULT_OUTPUT_DIR    = "checkpoints/tinyvla_pick_and_place"
 DEFAULT_EPOCHS        = 5
 DEFAULT_BATCH_SIZE    = 16
 DEFAULT_LR            = 1e-4
-DEFAULT_CHUNK_SIZE    = 20      # ACT action chunk horizon (20 steps @ 50Hz = 0.4 seconds)
+DEFAULT_CHUNK_SIZE    = 1       # Single-step prediction — matches dataset output
 DEFAULT_CHUNK_WEIGHT  = 0.1     # ACT temporal ensemble weight
 DEFAULT_SEED          = 42
 
@@ -339,6 +339,15 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
     logger.info(f"Training on device: {device}")
 
     # ---- Dataset -----------------------------------------------------------
+    chunk_size = config["policy"]["chunk_size"]
+    fps        = 30  # matches info.json fps
+
+    # delta_timestamps — single step to match dataset's natural output
+    delta_timestamps = {
+        "observation.state": [0.0],
+        "action": [0.0],
+    }
+
     datasets = []
     for repo_id, root in zip(
         config["dataset"]["repo_ids"],
@@ -346,12 +355,19 @@ def run_native_train(config: dict, dry_run: bool = False) -> None:
     ):
         full_path = str(Path(root) / repo_id)
         try:
-            # Try local-only load with full path as root (LeRobot v2)
             try:
-                ds = LeRobotDataset(repo_id=repo_id, root=full_path, local_files_only=True)
+                ds = LeRobotDataset(
+                    repo_id=repo_id,
+                    root=full_path,
+                    delta_timestamps=delta_timestamps,
+                    local_files_only=True,
+                )
             except TypeError:
-                # local_files_only not supported in this version — use root only
-                ds = LeRobotDataset(repo_id=repo_id, root=full_path)
+                ds = LeRobotDataset(
+                    repo_id=repo_id,
+                    root=full_path,
+                    delta_timestamps=delta_timestamps,
+                )
             datasets.append(ds)
             logger.info(f"  Loaded dataset: {repo_id} ({len(ds)} frames)")
         except Exception as ex:
