@@ -86,7 +86,7 @@ TASK_DESCRIPTION = (
 # ---------------------------------------------------------------------------
 
 DEFAULT_OUTPUT_DIR    = "checkpoints/tinyvla_pick_and_place"
-DEFAULT_EPOCHS        = 20
+DEFAULT_EPOCHS        = 5
 DEFAULT_BATCH_SIZE    = 16
 DEFAULT_LR            = 1e-4
 DEFAULT_CHUNK_SIZE    = 20      # ACT action chunk horizon (20 steps @ 50Hz = 0.4 seconds)
@@ -221,7 +221,7 @@ def build_lerobot_config(
             "feedforward_activation": "relu",
             "n_encoder_layers":      4,
             "n_decoder_layers":      1,
-            "use_vae":               True,
+            "use_vae":               False,
             "latent_dim":            32,
             "n_vae_encoder_layers":  4,
             # Loss
