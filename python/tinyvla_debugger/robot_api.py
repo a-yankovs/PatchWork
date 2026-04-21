@@ -8,12 +8,6 @@ Clean robot execution interface for the SkillPatch project.
 This module wraps LeRobot CLI workflows behind a small Python API that the
 SLM/orchestrator can call without needing to know the raw terminal commands.
 
-Important design choice
------------------------
-This implementation treats a skill as an ordered list of recorded LeRobot
-step-datasets. That matches the project goal of stepwise execution and
-verification:
-
     replay step -> yield StepEvent -> VLM verifies -> next step
 
 Because standard LeRobot replay is episode-based rather than natively
@@ -27,18 +21,6 @@ What this module does well
 - Stores persistent default parameters and learned patches.
 - Emits StepEvent objects after each step so the VLM/orchestrator can act.
 - Keeps everything local-only by default (no Hugging Face push required).
-
-What this module does NOT fully do yet
---------------------------------------
-- It does not physically rewrite underlying LeRobot trajectories.
-- apply_patch() updates persistent runtime patch memory/defaults.
-- Parameters such as z_offset_mm / approach_angle_deg / speed_scale are exposed
-  and tracked cleanly for the orchestrator, but actual low-level motion
-  transformation must be implemented later if the team decides to modify
-  trajectories directly.
-
-This makes the API honest and usable today while still matching the project's
-interface requirements.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -608,24 +590,3 @@ if __name__ == "__main__":
             "reset_time_s": 10,
         },
     ]
-
-    # Uncomment to create/record a real skill.
-    # api.record_skill(
-    #     "pick_and_place",
-    #     description="Pick object and place it in the box.",
-    #     steps=example_steps,
-    #     default_params={
-    #         "z_offset_mm": 0,
-    #         "speed_scale": 1.0,
-    #         "approach_angle_deg": 0,
-    #         "gripper_close_force": 0.6,
-    #         "retry_count": 2,
-    #     },
-    # )
-
-    # Example of replay + step events for the orchestrator/VLM.
-    # for event in api.replay_skill("pick_and_place", params={"z_offset_mm": 5}):
-    #     print(event)
-
-    # Example learned patch application.
-    # api.apply_patch("pick_and_place", {"z_offset_mm": 5, "speed_scale": 0.8})
