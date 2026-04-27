@@ -114,4 +114,5 @@ run.py           # pipeline entry point
 ## Team
 
 **Alexandra Yankovskaya, Vera Chuang, Diya Bengani, Elias Assalif**
+
 Built at StarkHacks 2026
